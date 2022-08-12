@@ -5,17 +5,15 @@
 from setuptools import setup, find_packages
 
 setup(
-    name = "DeformConv1D",
+    name = "dc1d",
     version = "1.0",
-    packages = find_packages(),
+    # packages = find_packages(),
 
-    install_requires = [
-        'pytorch',
-    ],
 
     entry_points = {
         'console_scripts': [
-            'deformconv1d = nnet.deform_conv:DeformConv1D',
+            'DeformConv1D = dc1d.nnet:DeformConv1D',
+            'linterpolate = d1cd.ops:linterpolate'
         ]
     }
 )
