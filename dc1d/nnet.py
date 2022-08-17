@@ -10,7 +10,6 @@ from torch.nn.modules.utils import _reverse_repeat_tuple
 
 from .ops import linterpolate
 
-
 class DeformConv1d(nn.Module):
     def __init__(self,
         in_channels: int,
@@ -124,29 +123,6 @@ class DeformConv1d(nn.Module):
             )
 
         return output
-
-if __name__ == '__main__':
-    batch_size = 1
-    length = 10
-    channels=2
-    kernel_size = 3
-    dilation = 2
-    groups = channels
-    stride = 2
-
-    x = torch.rand(batch_size, channels, length,requires_grad=True)
-    num_samples = (x.shape[-1]-dilation*(kernel_size-1))//stride
-    final_idx = (num_samples-1)*stride
-    print("num_samples:",num_samples)
-    print("final_idx:",final_idx)
-    
-    offsets = torch.ones(batch_size, groups, num_samples, kernel_size)
-    x_offset = interpolate(x, offsets, kernel_size, dilation, stride) # batch_size, in channels,output seq. length, kernel size
-    print("Input:",x)
-    print("Output:",x_offset)
-    print()
-
-exit()
 
 if __name__ == '__main__':
     import time

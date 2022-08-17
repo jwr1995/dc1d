@@ -62,3 +62,25 @@ def linterpolate(
             "(batch_size, in_channels, output_length, kernel_size)")
         assert x_offset.shape == (batch_size, x.shape[1],offsets.shape[-2], kernel_size)
     return x_offset
+
+
+if __name__ == '__main__':
+    batch_size = 1
+    length = 10
+    channels=2
+    kernel_size = 3
+    dilation = 2
+    groups = channels
+    stride = 2
+
+    x = torch.rand(batch_size, channels, length,requires_grad=True)
+    num_samples = (x.shape[-1]-dilation*(kernel_size-1))//stride
+    final_idx = (num_samples-1)*stride
+    print("num_samples:",num_samples)
+    print("final_idx:",final_idx)
+    
+    offsets = torch.ones(batch_size, groups, num_samples, kernel_size)
+    x_offset = interpolate(x, offsets, kernel_size, dilation, stride) # batch_size, in channels,output seq. length, kernel size
+    print("Input:",x)
+    print("Output:",x_offset)
+    print()
