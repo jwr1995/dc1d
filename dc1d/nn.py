@@ -1,6 +1,15 @@
+""" 
+nn.py provides classes for deformable convolution built on PyTorch functionality.
+
+Author: William Ravenscroft, August 2022
+Copyright William Ravenscroft 2022
+"""
+
+# Generic
 import math
 from typing import Optional, Tuple
 
+# PyTorch
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
@@ -8,6 +17,7 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 from torch.nn.modules.utils import _reverse_repeat_tuple
 
+# dc1d
 from .ops import linterpolate
 
 class DeformConv1d(nn.Module):
@@ -25,6 +35,20 @@ class DeformConv1d(nn.Module):
         *args,
         **kwargs
         ) -> None:
+        """
+        1D Deformable convolution kernel layer
+        Args:
+            in_channels (int): Value of convolution kernel size
+            out_channels (int): Value of convolution kernel dilation factor
+            kernel_size (int): Value of convolution kernel size
+            stride (int): Value convolution kernel stride
+            padding (int): See torch.nn.Conv1d for details. Default "valid". Still experimental beware of unexpected behaviour.
+            dilation (int): Value of convolution kernel dilation factor
+            groups (int) = 1
+            bias (bool) = True
+            padding_mode: See torch.nn.Conv1d for details. Default "reflect". Still experimental beware of unexpected behaviour.
+            device: Device to operate function on. Default: torch.device("cuda:0" if torch.cuda.is_available() else "cpu").
+        """
 
         self.device = device
         
@@ -65,7 +89,7 @@ class DeformConv1d(nn.Module):
             kernel_size,
             # requires_grad=True, 
             device=device
-            )
+            ) # automatically store dilation offsets
 
         if bias:
             self.bias = Parameter(torch.empty(out_channels))
@@ -87,15 +111,18 @@ class DeformConv1d(nn.Module):
         self, 
         input: Tensor, 
         offsets: Tensor, 
-        # mask: Optional[Tensor] = None # TODO
+        mask: Optional[Tensor] = None # TODO
         ) -> Tensor:
         """
+        Forward pass of 1D deformable convolution layer
         Args:
             input (Tensor[batch_size, in_channels, length]): input tensor
-            offset (Tensor[batch_size, offset_groups * kernel_width, otuput length]):
-                offsets to be applied for each position in the convolution kernel.
-            mask (Tensor[batch_size, offset_groups * kernel_width, 1, out_width]):
-                masks to be applied for each position in the convolution kernel.
+            offset (Tensor[batch_size, offset_groups, output length, kernel_size]):
+                offsets to be applied for each position in the convolution kernel. Offset groups can be 1 or such that (in_channels%offset_grous == 0) is satisfied.
+            mask (Tensor[batch_size, offset_groups, kernel_width, 1, out_width]): To be implemented
+
+        Returns:
+            output (Tensor[batch_size, in_channels, length]): output tensor
         """
         
         if self.padding_mode != 'zeros':
@@ -168,6 +195,7 @@ if __name__ == '__main__':
     output_length = x.shape[-1]-dilation*(kernel_size-1)
     offsets = nn.Parameter(torch.ones(batch_size, 1, output_length, kernel_size, requires_grad=True, device="cuda"))
 
+    # Time DeformConv1d
     start = time.time()
     y = model(x, offsets)
     end = time.time()
@@ -175,9 +203,10 @@ if __name__ == '__main__':
     print("Deformable runtime =",end-start)
     z = torch.mean(y)
     z.backward(retain_graph=True)
-    print(type(offsets.grad) == type(None))
-    # print(offsets.grad)
+    are_offsets_grads_none = (type(offsets.grad) == type(None))
+    assert are_offsets_grads_none == False, "Offset grads are of type None, backpropagation not possible :Z"
 
+    # Time vanilla Conv1d
     start = time.time()
     y = vanilla_model(x)
     end = time.time()

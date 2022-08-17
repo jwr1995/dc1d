@@ -1,3 +1,9 @@
+""" 
+ops.py provides operation functions for defomrable convolution
+
+Author: William Ravenscroft, August 2022
+Copyright William Ravenscroft 2022
+"""
 import torch
 
 def linterpolate(
@@ -12,14 +18,14 @@ def linterpolate(
     ):
     """
     Linear interpolation function for 1D deformable convolution. 
-    Inputs:
-        x, 
-        offsets,
-        kernel_size, 
-        dilation,
-        stride,
-        dilated_positions=None,
-        device="cpu"
+    Args:
+        x (Tensor): Input Data Tensor of shape batch size x channels x length
+        offsets (Tensor): Deforming offset Tensor of shape batch size x offset groups x number of offset positions x kernel size
+        kernel_size (int): Value of convolution kernel size
+        dilation (int): Value of convolution kernel dilation factor
+        stride (int): Value convolution kernel stride
+        dilated_positions (Tensor): Allows user to save computation by using precomputed dilation offset positions. If not these can be computed from dilation kernel_size for each function call
+        device: Device to operate function on. Default: "cpu".
     """
     # Every index in x we need to consider
     if dilated_positions == None:
@@ -65,6 +71,8 @@ def linterpolate(
 
 
 if __name__ == '__main__':
+
+    # Use small values to easily observe effects
     batch_size = 1
     length = 10
     channels=2
@@ -72,15 +80,20 @@ if __name__ == '__main__':
     dilation = 2
     groups = channels
     stride = 2
+    _test = False # Leave as false unless you want to see all intermediate shapes of linterpolate(...)
 
+    # Input tensor
     x = torch.rand(batch_size, channels, length,requires_grad=True)
+    
+    # Compute required number of offsets in the temporal direction (sequential length)
+    # Uses delay/offset of 1 to test sample offset. Just edit to "2*torch.ones(..." for shift of 2 and so on
     num_samples = (x.shape[-1]-dilation*(kernel_size-1))//stride
     final_idx = (num_samples-1)*stride
-    print("num_samples:",num_samples)
-    print("final_idx:",final_idx)
-    
     offsets = torch.ones(batch_size, groups, num_samples, kernel_size)
-    x_offset = interpolate(x, offsets, kernel_size, dilation, stride) # batch_size, in channels,output seq. length, kernel size
+    
+    # Compute interpolated offset positions of x
+    x_offset = linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
+    
+    # View results
     print("Input:",x)
     print("Output:",x_offset)
-    print()

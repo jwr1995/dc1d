@@ -17,3 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+
+[project.urls]
+"Homepage" = "https://github.com/jwr1995/DeformConv1d"
+"Bug Tracker" = "https://github.com/jwr1995/DeformConv1d/issues"
