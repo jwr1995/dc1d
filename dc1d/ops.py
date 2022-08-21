@@ -4,6 +4,8 @@ ops.py provides operation functions for defomrable convolution
 Author: William Ravenscroft, August 2022
 Copyright William Ravenscroft 2022
 """
+
+# PyTorch
 import torch
 
 def linterpolate(

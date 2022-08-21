@@ -12,3 +12,4 @@ dist/dc1d-1.0-py3.8.egg
 dist/dc1d-1.0-py3.9.egg
 dist/dc1d-0.0.1-py3-none-any.whl
 dist/dc1d-0.0.1.tar.gz
+dc1d/__pycache__/nn.cpython-38.pyc

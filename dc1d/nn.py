@@ -18,7 +18,7 @@ from torch.nn.parameter import Parameter
 from torch.nn.modules.utils import _reverse_repeat_tuple
 
 # dc1d
-from .ops import linterpolate
+from dc1d.ops import linterpolate
 
 class DeformConv1d(nn.Module):
     def __init__(self,
