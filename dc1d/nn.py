@@ -6,7 +6,8 @@ Copyright William Ravenscroft 2022
 """
 
 # Generic
-import math
+import math, time
+from turtle import forward
 from typing import Optional, Tuple
 
 # PyTorch
@@ -16,9 +17,13 @@ from torch import nn, Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
 from torch.nn.modules.utils import _reverse_repeat_tuple
+from typing import Callable
+
+# Speechbrain
+from speechbrain.lobes.models.conv_tasnet import GlobalLayerNorm as gLN
 
 # dc1d
-from dc1d.ops import linterpolate
+from dc1d.ops import kernel_width_linterpolate, full_seq_linterpolate
 
 class DeformConv1d(nn.Module):
     def __init__(self,
@@ -32,6 +37,7 @@ class DeformConv1d(nn.Module):
         bias: bool = True,
         padding_mode: str = "reflect",
         device: str = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        interpolation_function: Callable = kernel_width_linterpolate,
         *args,
         **kwargs
         ) -> None:
@@ -51,6 +57,7 @@ class DeformConv1d(nn.Module):
         """
 
         self.device = device
+        self.interpolation_function = interpolation_function
         
         super(DeformConv1d, self).__init__(*args,**kwargs)
 
@@ -132,8 +139,8 @@ class DeformConv1d(nn.Module):
                 mode=self.padding_mode
                 )
 
-        x_offset = linterpolate(
-            x, 
+        input = self.interpolation_function(
+            input, 
             kernel_size=self.kernel_size, 
             dilation=self.dilation,
             offsets=offsets, 
@@ -141,8 +148,8 @@ class DeformConv1d(nn.Module):
             dilated_positions=self.dilated_positions,
             device=self.device
             ) 
-
-        output=F.conv1d(x_offset.flatten(-2,-1), 
+        input = input.flatten(-2,-1)
+        output=F.conv1d(input, 
             self.weight, 
             self.bias, 
             stride=self.kernel_size, 
@@ -151,20 +158,84 @@ class DeformConv1d(nn.Module):
 
         return output
 
+class PackedDeformConv1d(DeformConv1d):
+    def __init__(self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = "valid",
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "reflect",
+        offset_groups: int = 1,
+        device: str = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        interpolation_function: Callable = kernel_width_linterpolate,
+        *args,
+        **kwargs
+        ) -> None:
+        assert offset_groups in [1,in_channels], "offset_groups only implemented for offset_gorups in {1,in_channels}"
+        
+        super(PackedDeformConv1d,self).__init__(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            stride = stride,
+            padding = padding,
+            dilation = dilation,
+            groups = groups,
+            bias = bias,
+            padding_mode = padding_mode,
+            device = device,
+            interpolation_function = interpolation_function,
+            *args,
+            **kwargs
+            )
+        self.offset_groups = offset_groups
+
+        self.offset_dconv = nn.Conv1d(in_channels,in_channels,kernel_size,stride=1,groups=in_channels,padding=padding,padding_mode=padding_mode,bias=False)
+        self.odc_norm = gLN(in_channels)
+        self.odc_prelu = nn.PReLU()
+        
+        self.offset_pconv = nn.Conv1d(in_channels,kernel_size*offset_groups,1,stride=1,bias=False)
+        self.odp_norm = gLN(kernel_size*offset_groups)
+        self.odp_prelu = nn.PReLU()
+        
+        # self.offset_pconv_test = nn.Conv1d(in_channels,kernel_size*offset_groups,1,stride=1,bias=False)
+
+        self.device=device
+        self.to(device)
+        print(self.offset_dconv.weight.shape)
+    
+    def forward(self, x):
+        offsets = self.offset_dconv(x)
+        offsets = self.odc_norm(self.odc_prelu(offsets).moveaxis(1,2)).moveaxis(2,1)
+
+
+        offsets = self.offset_pconv(offsets)
+        offsets = self.odp_norm(self.odp_prelu(offsets).moveaxis(1,2)).moveaxis(2,1) # batch_size x (kernel_size*offset_groups) x length
+
+        offsets = offsets.unsqueeze(0).chunk(self.offset_groups,dim=2)# batch_size x offset_groups x length x kernel_size
+        
+        offsets = torch.vstack(offsets).moveaxis((0,2),(1,3))# batch_size x offset_groups x length x kernel_size
+        
+        return super().forward(x,offsets)
+
 if __name__ == '__main__':
-    import time
-    batch_size = 16
+    # import time
+    batch_size = 4
     in_channels = 512
     out_channels = 512
-    kernel_size = 16
+    kernel_size = 3
     stride = 1
     padding = "same"
-    dilation = 3
-    groups = 1
+    dilation = 2^7
+    groups = 512
     bias = True
-    length = 128
+    length = 1998
 
-    model = DeformConv1d(
+    model = PackedDeformConv1d(
         in_channels = in_channels,
         out_channels = out_channels,
         kernel_size = kernel_size,
@@ -173,8 +244,27 @@ if __name__ == '__main__':
         dilation = dilation,
         groups = groups,
         bias = True,
+        offset_groups=in_channels,
         device="cuda"
     )
+
+    x = torch.rand(batch_size, in_channels, length,requires_grad=True).cuda()
+    print("Input shape",x.shape)
+    
+    output_length = x.shape[-1]-dilation*(kernel_size-1)
+    
+    offsets = torch.ones(batch_size, 1, 1998, kernel_size, device="cuda", requires_grad=True)
+    
+    # Time DeformConv1d
+    for i in range(3):
+        start = time.time()  
+        y = model(x)
+        end = time.time()
+        print(f"Deformable runtime #{i} = {end-start}s")
+    print("Output shape",y.shape)
+    
+    z = torch.mean(y)
+    z.backward(retain_graph=True)
 
     vanilla_model = nn.Conv1d(
         in_channels = in_channels,
@@ -189,28 +279,10 @@ if __name__ == '__main__':
         device="cuda"
     )
     
-    x = torch.rand(batch_size, in_channels, length,requires_grad=True).cuda()
-    print(x.shape)
-    
-    output_length = x.shape[-1]-dilation*(kernel_size-1)
-    offsets = nn.Parameter(torch.ones(batch_size, 1, output_length, kernel_size, requires_grad=True, device="cuda"))
-
-    # Time DeformConv1d
-    start = time.time()
-    y = model(x, offsets)
-    end = time.time()
-    print(y.shape)
-    print("Deformable runtime =",end-start)
-    z = torch.mean(y)
-    z.backward(retain_graph=True)
-    are_offsets_grads_none = (type(offsets.grad) == type(None))
-    assert are_offsets_grads_none == False, "Offset grads are of type None, backpropagation not possible :Z"
-
-    # Time vanilla Conv1d
     start = time.time()
     y = vanilla_model(x)
     end = time.time()
-    print(y.shape)
+    print("Vanilla shape",y.shape)
     print("Vanilla runtime =",end-start)
 
    
