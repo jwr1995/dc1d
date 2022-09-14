@@ -35,7 +35,6 @@ def full_seq_linterpolate(
     # Every index in x we need to consider
     if dilated_positions == None:
         dilated_positions = torch.linspace(0, dilation*kernel_size-dilation,kernel_size,device=device) # kernel_size
-    print(dilated_positions)
     max_t0 = (offsets.shape[-2]-1)*stride
     t0s = torch.linspace(0, max_t0, offsets.shape[-2],device=device).unsqueeze(-1) # out_length x 1
     dilated_offsets_repeated = dilated_positions+offsets
@@ -97,6 +96,7 @@ def kernel_width_linterpolate(
     _multiprocess=False,
     _max_memory=True
 ):
+    assert x.device == offsets.device, "x and offsets must be on same device"
     kernel_rfield=dilation*(kernel_size-1)+1
     # Every index in x we need to consider
     if dilated_positions == None:
@@ -105,8 +105,8 @@ def kernel_width_linterpolate(
     max_t0 = (offsets.shape[-2]-1)*stride
     t0s = torch.linspace(0, max_t0, offsets.shape[-2],device=device).unsqueeze(-1) # out_length x 1
     dilated_offsets_repeated = dilated_positions+offsets
+    
     T = t0s + dilated_offsets_repeated # batch_size x channels x out_length x kernel_size
-
     T = torch.max(T, t0s)
     T = torch.min(T, t0s+torch.max(dilated_positions))
 
@@ -123,19 +123,24 @@ def kernel_width_linterpolate(
         U = t0s+torch.linspace(0,kernel_rfield-1,kernel_rfield,device=device).repeat(1,1,1,1) # 1 x 1 x 1 x length x kernel_rfield
         if _test:
             print("U:",U.shape)
+
         abs_sub = 1-torch.abs(U.unsqueeze(-1)-T.unsqueeze(-2)) # batch_size x groups x out_length x kernel_size x_length
         if _test:
             print("abs_sub:", abs_sub.shape)
+
         _zeros = torch.zeros(abs_sub.shape,device=device)
         x = x.unfold(dimension=2, size=kernel_rfield, step=stride).unsqueeze(-1)
         if _test:
             print("x unfolded:",x.shape)
+
         G = torch.max(_zeros, abs_sub) # batch_size x groups x out_length x kernel_rfield x kernel_size
         if _test:
             print("G:",G.shape)
+
         mx = torch.multiply(G,x)
         x_offset = torch.sum(mx, axis=-2)  # batch_size x channels x output_length x kernel size
         return x_offset
+
     elif not _multiprocess: 
         x_offset = torch.zeros((x.shape[0], x.shape[1], offsets.shape[-2], kernel_size),device=x.device)
         for i in range(t0s.shape[0]):
@@ -148,6 +153,7 @@ def kernel_width_linterpolate(
             mx = torch.multiply(G,x[:,:,t0:max_U+1].unsqueeze(-2))
             x_offset[:,:,i,:,] = torch.sum(mx, axis=-1)   # batch_size x channels x output_length x kernel size
         return x_offset
+
     else:
         x_offset = torch.zeros((x.shape[0], x.shape[1], offsets.shape[-2], kernel_size),device=x.device)
         T.share_memory_()

@@ -36,7 +36,7 @@ class DeformConv1d(nn.Module):
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = "reflect",
-        device: str = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        device: str = "cpu",
         interpolation_function: Callable = kernel_width_linterpolate,
         *args,
         **kwargs
@@ -95,7 +95,6 @@ class DeformConv1d(nn.Module):
             dilation*kernel_size-dilation,
             kernel_size,
             # requires_grad=True, 
-            device=device
             ) # automatically store dilation offsets
 
         if bias:
@@ -138,13 +137,16 @@ class DeformConv1d(nn.Module):
                 self._reversed_padding_repeated_twice, 
                 mode=self.padding_mode
                 )
-
+        if not self.device == offsets.device: # naive assumption
+            self.device = offsets.device
+        if self.dilated_positions.device != self.device:
+            self.dilated_positions = self.dilated_positions.to(offsets.device)
         input = self.interpolation_function(
             input, 
             kernel_size=self.kernel_size, 
             dilation=self.dilation,
             offsets=offsets, 
-            stride=stride,
+            stride=self.stride,
             dilated_positions=self.dilated_positions,
             device=self.device
             ) 
@@ -170,12 +172,27 @@ class PackedDeformConv1d(DeformConv1d):
         bias: bool = True,
         padding_mode: str = "reflect",
         offset_groups: int = 1,
-        device: str = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        device: str = "cpu",
         interpolation_function: Callable = kernel_width_linterpolate,
         *args,
         **kwargs
         ) -> None:
-        assert offset_groups in [1,in_channels], "offset_groups only implemented for offset_gorups in {1,in_channels}"
+        """
+        Packed 1D Deformable convolution class. Depthwise-Separable convolution is used to compute offsets.
+        Args:
+            in_channels (int): Value of convolution kernel size
+            out_channels (int): Value of convolution kernel dilation factor
+            kernel_size (int): Value of convolution kernel size
+            stride (int): Value convolution kernel stride
+            padding (int): See torch.nn.Conv1d for details. Default "valid". Still experimental beware of unexpected behaviour.
+            dilation (int): Value of convolution kernel dilation factor
+            groups (int): 1 or in_channels
+            bias (bool): Whether to use bias. Default = True
+            padding_mode (str): See torch.nn.Conv1d for details. Default "reflect". Still experimental beware of unexpected behaviour.
+            offset_groups (int): 1 or in_channels
+            device: Device to operate function on. Default: torch.device("cuda:0" if torch.cuda.is_available() else "cpu").
+        """
+        assert offset_groups in [1,in_channels], "offset_groups only implemented for offset_groups in {1,in_channels}"
         
         super(PackedDeformConv1d,self).__init__(
             in_channels = in_channels,
@@ -206,21 +223,26 @@ class PackedDeformConv1d(DeformConv1d):
 
         self.device=device
         self.to(device)
-        print(self.offset_dconv.weight.shape)
     
-    def forward(self, x):
+    def forward(self, x, with_offsets=False):
+        
         offsets = self.offset_dconv(x)
         offsets = self.odc_norm(self.odc_prelu(offsets).moveaxis(1,2)).moveaxis(2,1)
 
+        self.device = offsets.device # naive assumption to fix errors
+
+        assert str(x.device) == str(self.device), f"Input is on {x.device} but self is on {self.device}"
+        assert str(x.device) == str(offsets.device), f"Input is on {x.device} but self is on {self.device}"
 
         offsets = self.offset_pconv(offsets)
         offsets = self.odp_norm(self.odp_prelu(offsets).moveaxis(1,2)).moveaxis(2,1) # batch_size x (kernel_size*offset_groups) x length
-
         offsets = offsets.unsqueeze(0).chunk(self.offset_groups,dim=2)# batch_size x offset_groups x length x kernel_size
-        
         offsets = torch.vstack(offsets).moveaxis((0,2),(1,3))# batch_size x offset_groups x length x kernel_size
-        
-        return super().forward(x,offsets)
+
+        if with_offsets:
+            return super().forward(x,offsets), offsets
+        else:
+            return super().forward(x,offsets)
 
 if __name__ == '__main__':
     # import time
