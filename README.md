@@ -71,6 +71,24 @@ python dc1d.nn.py
 ```
 to compare the runtime of our ```DeformConv1d``` layer against ```torch.nn.Conv1d```.
 
+# Papers
+I will soon publish a paper using this package in the mean time if you find this package useful please cite one of my other works below.
+```
+@article{ravenscroft2022receptive,
+  title={Receptive Field Analysis of Temporal Convolutional Networks for Monaural Speech Dereverberation},
+  author={Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
+  journal={arXiv preprint arXiv:2204.06439},
+  year={2022}
+}
+
+@article{ravenscroft2022utterance,
+  title={Utterance Weighted Multi-Dilation Temporal Convolutional Networks for Monaural Speech Dereverberation},
+  author={Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
+  journal={arXiv preprint arXiv:2205.08455},
+  year={2022}
+}
+```
+
 # Some notes for those interested
 I experimented with retooling the ```torchvision.ops.deform_conv2d``` function for 1d convolution. This seemed to work but it is beyond my current capability to verify whether it is operating as intended. I can provide this code for anyone interested as it is faster than the code here but should be tested thoroughly before using. The tensor shapes are correct but the offset shape is designed implicitly in the ```deform_conv2d`` function so it is unknown how the data is being reshaped exactly inside the function unless you are able to find and understand the raw cuda and c++ in the kernel code. A similar project tvdcn also exists which has adapted the raw 2D CUDA kernel operations to 1D and 3D operations: https://github.com/inspiros/tvdcn. I decided to pursue this alternate implementation anyway for the aforementioned implict tensor reshaping mentioned above.
 
