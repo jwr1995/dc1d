@@ -67,7 +67,7 @@ print("Deformable runtime =",end-start)
 ---
 For more detailed examples, the ```nn``` and ```ops``` modules have example usage scripts appended to the bottom of the file inside their ```if __name__ == "__main__":``` clauses. For example one could run 
 ```
-python dc1d.nn.py
+python dc1d/nn.py
 ```
 to compare the runtime of our ```DeformConv1d``` layer against ```torch.nn.Conv1d```.
 
