@@ -1,6 +1,9 @@
 """ 
 nn.py provides classes for deformable convolution built on PyTorch functionality.
 
+gLN and cLN layers are copied from the SpeechBrain framework:
+https://speechbrain.readthedocs.io/en/latest/_modules/speechbrain/lobes/models/conv_tasnet.html
+
 Author: William Ravenscroft, August 2022
 Copyright William Ravenscroft 2022
 """
@@ -18,9 +21,6 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 from torch.nn.modules.utils import _reverse_repeat_tuple
 from typing import Callable
-
-# Speechbrain
-from speechbrain.lobes.models.conv_tasnet import GlobalLayerNorm as gLN
 
 # dc1d
 from dc1d.ops import kernel_width_linterpolate, full_seq_linterpolate
@@ -94,7 +94,6 @@ class DeformConv1d(nn.Module):
         self.dilated_positions = torch.linspace(0,
             dilation*kernel_size-dilation,
             kernel_size,
-            # requires_grad=True, 
             ) # automatically store dilation offsets
 
         if bias:
@@ -124,7 +123,7 @@ class DeformConv1d(nn.Module):
         Args:
             input (Tensor[batch_size, in_channels, length]): input tensor
             offset (Tensor[batch_size, offset_groups, output length, kernel_size]):
-                offsets to be applied for each position in the convolution kernel. Offset groups can be 1 or such that (in_channels%offset_grous == 0) is satisfied.
+                offsets to be applied for each position in the convolution kernel. Offset groups can be 1 or such that (in_channels%offset_groups == 0) is satisfied.
             mask (Tensor[batch_size, offset_groups, kernel_width, 1, out_width]): To be implemented
 
         Returns:
@@ -224,15 +223,22 @@ class PackedDeformConv1d(DeformConv1d):
         self.device=device
         self.to(device)
     
-    def forward(self, x, with_offsets=False):
-        
-        offsets = self.offset_dconv(x)
+    def forward(self, input, with_offsets=False):
+        """
+        Forward pass of 1D deformable convolution layer
+        Args:
+            input (Tensor[batch_size, in_channels, length]): input tensor
+            
+        Returns:
+            output (Tensor[batch_size, in_channels, length]): output tensor
+        """
+        offsets = self.offset_dconv(input)
         offsets = self.odc_norm(self.odc_prelu(offsets).moveaxis(1,2)).moveaxis(2,1)
 
         self.device = offsets.device # naive assumption to fix errors
 
-        assert str(x.device) == str(self.device), f"Input is on {x.device} but self is on {self.device}"
-        assert str(x.device) == str(offsets.device), f"Input is on {x.device} but self is on {self.device}"
+        assert str(input.device) == str(self.device), f"Input is on {input.device} but self is on {self.device}"
+        assert str(input.device) == str(offsets.device), f"Input is on {input.device} but self is on {self.device}"
 
         offsets = self.offset_pconv(offsets)
         offsets = self.odp_norm(self.odp_prelu(offsets).moveaxis(1,2)).moveaxis(2,1) # batch_size x (kernel_size*offset_groups) x length
@@ -240,9 +246,107 @@ class PackedDeformConv1d(DeformConv1d):
         offsets = torch.vstack(offsets).moveaxis((0,2),(1,3))# batch_size x offset_groups x length x kernel_size
 
         if with_offsets:
-            return super().forward(x,offsets), offsets
+            return super().forward(input,offsets), offsets
         else:
-            return super().forward(x,offsets)
+            return super().forward(input,offsets)
+
+EPS=1e-9
+
+class gLN(nn.Module):
+    """Global Layer Normalization (gLN).
+
+    Copyright SpeechBrain 2022
+
+    Arguments
+    ---------
+    channel_size : int
+        Number of channels in the third dimension.
+
+    Example
+    -------
+    >>> x = torch.randn(2, 3, 3)
+    >>> norm_func = GlobalLayerNorm(3)
+    >>> x_normalized = norm_func(x)
+    >>> x.shape
+    torch.Size([2, 3, 3])
+    """
+
+    def __init__(self, channel_size):
+        super(gLN, self).__init__()
+        self.gamma = nn.Parameter(torch.Tensor(1, 1, channel_size))  # [1, 1, N]
+        self.beta = nn.Parameter(torch.Tensor(1, 1, channel_size))  # [1, 1, N]
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Resets the parameters."""
+        self.gamma.data.fill_(1)
+        self.beta.data.zero_()
+
+
+    def forward(self, y):
+        """
+        Arguments
+        ---------
+        y : Tensor
+            Tensor shape [M, K, N]. M is batch size, N is channel size, and K is length.
+
+        Returns
+        -------
+        gLN_y : Tensor
+            Tensor shape [M, K. N]
+        """
+        mean = y.mean(dim=1, keepdim=True).mean(
+            dim=2, keepdim=True
+        )  # [M, 1, 1]
+        var = (
+            (torch.pow(y - mean, 2))
+            .mean(dim=1, keepdim=True)
+            .mean(dim=2, keepdim=True)
+        )
+        gLN_y = self.gamma * (y - mean) / torch.pow(var + EPS, 0.5) + self.beta
+        return gLN_y
+
+
+class cLN(nn.Module):
+    """Channel-wise Layer Normalization (cLN).
+
+    Arguments
+    ---------
+    channel_size : int
+        Number of channels in the normalization dimension (the third dimension).
+
+    Example
+    -------
+    >>> x = torch.randn(2, 3, 3)
+    >>> norm_func = ChannelwiseLayerNorm(3)
+    >>> x_normalized = norm_func(x)
+    >>> x.shape
+    torch.Size([2, 3, 3])
+    """
+
+    def __init__(self, channel_size):
+        super(cLN, self).__init__()
+        self.gamma = nn.Parameter(torch.Tensor(1, 1, channel_size))  # [1, 1, N]
+        self.beta = nn.Parameter(torch.Tensor(1, 1, channel_size))  # [1, 1, N]
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Resets the parameters."""
+        self.gamma.data.fill_(1)
+        self.beta.data.zero_()
+
+
+    def forward(self, y):
+        """
+        Args:
+            y: [M, K, N], M is batch size, N is channel size, K is length
+        Returns:
+            cLN_y: [M, K, N]
+        """
+        mean = torch.mean(y, dim=2, keepdim=True)  # [M, K, 1]
+        var = torch.var(y, dim=2, keepdim=True, unbiased=False)  # [M, K, 1]
+        cLN_y = self.gamma * (y - mean) / torch.pow(var + EPS, 0.5) + self.beta
+        return cLN_y
 
 if __name__ == '__main__':
     # import time
