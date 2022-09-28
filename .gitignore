@@ -11,3 +11,5 @@ dc1d.egg-info/top_level.txt
 dist/
 dc1d/__pycache__/
 core.*
+build_upload_test.sh
+build_upload.sh
