@@ -6,7 +6,7 @@ https://speechbrain.readthedocs.io/en/latest/_modules/speechbrain/lobes/models/c
 See licence here: https://github.com/speechbrain/speechbrain/blob/develop/LICENSE
 Copyright SpeechBrain 2022.
 
-The reser_paramteres functions were adapted from the PyTorch ConvNd classes:
+The reset_paramters functions were adapted from the PyTorch ConvNd classes:
 https://pytorch.org/docs/stable/_modules/torch/nn/modules/conv.html#Conv1d
 Copyright 2022, PyTorch Contributors.
 
