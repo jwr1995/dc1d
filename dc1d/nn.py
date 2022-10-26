@@ -3,7 +3,10 @@ nn.py provides classes for deformable convolution built on PyTorch functionality
 
 gLN and cLN layers are copied from the SpeechBrain framework:
 https://speechbrain.readthedocs.io/en/latest/_modules/speechbrain/lobes/models/conv_tasnet.html
+See licence here: https://github.com/speechbrain/speechbrain/blob/develop/LICENSE
+Copyright SpeechBrain 2022
 
+The remainder of this module is original code belonging to the dc1d project.
 Author: William Ravenscroft, August 2022
 Copyright William Ravenscroft 2022
 """
