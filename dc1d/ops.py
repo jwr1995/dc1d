@@ -110,6 +110,7 @@ def kernel_width_linterpolate(
     T = torch.max(T, t0s)
     T = torch.min(T, t0s+torch.max(dilated_positions))
 
+
     if _test:
         print("x:",x.shape) # batch_size x in_channels x input_length
         print("offsets:",offsets.shape) # batch_size x groups x out_length x kernel_size
@@ -167,17 +168,75 @@ def kernel_width_linterpolate(
                 )
         return x_offset
 
-if __name__ == '__main__':
+def efficient_linterpolate(
+    x, 
+    offsets,
+    kernel_size, 
+    dilation,
+    stride,
+    dilated_positions=None,
+    device="cpu",
+    _test=False,
+):
+    assert x.device == offsets.device, "x and offsets must be on same device"
+    kernel_rfield=dilation*(kernel_size-1)+1
+    # Every index in x we need to consider
+    if dilated_positions == None:
+        dilated_positions = torch.linspace(0, kernel_rfield-1,kernel_size,device=device) # kernel_size
+    
+    max_t0 = (offsets.shape[-2]-1)*stride
+    t0s = torch.linspace(0, max_t0, offsets.shape[-2],device=device).unsqueeze(-1) # out_length x 1
+    dilated_offsets_repeated = dilated_positions+offsets
+    
+    T = t0s + dilated_offsets_repeated # batch_size x channels x out_length x kernel_size
+    T = torch.max(T, t0s)
+    T = torch.min(T, t0s+torch.max(dilated_positions))
+    
+    if _test:
+        print("x:",x.shape) # batch_size x in_channels x input_length
+        print("offsets:",offsets.shape) # batch_size x groups x out_length x kernel_size
+        print("max_t0:", max_t0)
+        print("t0s:",t0s.shape) # out_lengths x 1
+        print("dilated positions:",dilated_positions.shape) # kernel_size
+        print("dilated_offsets_repeated:",dilated_offsets_repeated.shape)
+        print("T:",T.shape) # batch_size x groups x out_length x kernel_rfield
 
+    U = torch.floor(T).to(torch.long) # 1 x 1 x length x kernel_rfield
+    U = torch.clamp(U,min=0,max=x.shape[2]-2)
+
+    if _test:
+        print("U:",U.shape)
+        # print("U_ceil:",U.shape)
+
+    U = torch.stack([U,U+1],dim=-1)
+    if U.shape[1] < x.shape[1]:
+        U=U.repeat(1,x.shape[1],1,1,1)
+    if _test:
+        print("U:", U.shape)
+
+    x=x.unsqueeze(-1).repeat(1,1,1,U.shape[-1])
+    x = torch.stack([x.gather(index=U[:,:,:,i,:],dim=-2) for i in range(U.shape[-2])],dim=-1)
+    
+    G = torch.max(torch.zeros(U.shape,device=device), 1-torch.abs(U-T.unsqueeze(-1))) # batch_size x groups x out_length x kernel_rfield x kernel_size
+    if _test:
+        print("G:",G.shape)
+
+    mx = torch.multiply(G,x.moveaxis(-2,-1))
+    return torch.sum(mx, axis=-1)  # batch_size x channels x output_length x kernel size
+   
+
+if __name__ == '__main__':
+    import time
     # Use small values to easily observe effects
-    batch_size = 2
-    length = 12
+    batch_size = 1
+    length = 15
     channels=2
     kernel_size = 3
-    dilation = 2
+    dilation = 3
     groups = 1
     stride = 2
     _test = True # Leave as false unless you want to see all intermediate shapes of linterpolate(...)
+    torch.random.manual_seed(1234)
 
     # Input tensor
     x = torch.rand(batch_size, channels, length,requires_grad=True)
@@ -186,12 +245,25 @@ if __name__ == '__main__':
     # Uses delay/offset of 1 to test sample offset. Just edit to "2*torch.ones(..." for shift of 2 and so on
     num_samples = (x.shape[-1]-dilation*(kernel_size-1))//stride
     final_idx = (num_samples-1)*stride
-    offsets = 1*torch.ones(batch_size, groups, num_samples, kernel_size)
+    offsets = -0.5*torch.ones(batch_size, groups, num_samples, kernel_size)
     
     # Compute interpolated offset positions of x
     # x_offset = full_seq_linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
     # exit()
-    x_offset = kernel_width_linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
+    # start=time.time()
+    # x_offset = kernel_width_linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
+    # stop=time.time()
+    # print("Ellapsed:",stop-start,"s")
+    # # View results
+    # if _test:
+    #     print(f"Input {x.shape}:",x)
+    #     print(f"Output {x_offset.shape}:",x_offset)
+
+    start=time.time()
+    x_offset = efficient_linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
+    stop=time.time()
+    print("Ellapsed:",stop-start,"s")
     # View results
-    print("Input:",x)
-    print("Output:",x_offset)
+    if _test:
+        print(f"Input {x.shape}:",x)
+        print(f"Output {x_offset.shape}:",x_offset)

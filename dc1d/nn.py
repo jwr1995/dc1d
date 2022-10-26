@@ -23,7 +23,7 @@ from torch.nn.modules.utils import _reverse_repeat_tuple
 from typing import Callable
 
 # dc1d
-from dc1d.ops import kernel_width_linterpolate, full_seq_linterpolate
+from dc1d.ops import kernel_width_linterpolate, full_seq_linterpolate, efficient_linterpolate
 
 class DeformConv1d(nn.Module):
     def __init__(self,
@@ -37,7 +37,7 @@ class DeformConv1d(nn.Module):
         bias: bool = True,
         padding_mode: str = "reflect",
         device: str = "cpu",
-        interpolation_function: Callable = kernel_width_linterpolate,
+        interpolation_function: Callable = efficient_linterpolate,
         *args,
         **kwargs
         ) -> None:
@@ -172,7 +172,7 @@ class PackedDeformConv1d(DeformConv1d):
         padding_mode: str = "reflect",
         offset_groups: int = 1,
         device: str = "cpu",
-        interpolation_function: Callable = kernel_width_linterpolate,
+        interpolation_function: Callable = efficient_linterpolate,
         *args,
         **kwargs
         ) -> None:
