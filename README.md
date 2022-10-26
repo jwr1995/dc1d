@@ -1,4 +1,4 @@
-# DeformConv1D
+# dc1d (DeformConv1d)
 An 1D implementation of a deformable convolutional layer implemented in pure Python in PyTorch. The code style is designed to imitate similar classes in PyTorch such as ```torch.nn.Conv1D``` and ```torchvision.ops.DeformConv2D```.
 
 # Requirements
@@ -71,25 +71,14 @@ python dc1d/nn.py
 ```
 to compare the runtime of our ```DeformConv1d``` layer against ```torch.nn.Conv1d```.
 
+A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes the offsets using a depthwise separable convolutionoperation as detailed in our paper below 
+
 # Papers
-I will soon publish a paper using this package in the mean time if you find this package useful please cite one of my other works below.
+Please cite the following if you use this package4
 ```
-@article{ravenscroft2022receptive,
-  title={Receptive Field Analysis of Temporal Convolutional Networks for Monaural Speech Dereverberation},
+@article{ravenscroft2022dtcn,
+  title={Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation},
   author={Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
-  journal={arXiv preprint arXiv:2204.06439},
-  year={2022}
-}
-
-@article{ravenscroft2022utterance,
-  title={Utterance Weighted Multi-Dilation Temporal Convolutional Networks for Monaural Speech Dereverberation},
-  author={Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
-  journal={arXiv preprint arXiv:2205.08455},
   year={2022}
 }
 ```
-
-# Some notes for those interested
-I experimented with retooling the ```torchvision.ops.deform_conv2d``` function for 1d convolution. This seemed to work but it is beyond my current capability to verify whether it is operating as intended. I can provide this code for anyone interested as it is faster than the code here but should be tested thoroughly before using. The tensor shapes are correct but the offset shape is designed implicitly in the ```deform_conv2d`` function so it is unknown how the data is being reshaped exactly inside the function unless you are able to find and understand the raw cuda and c++ in the kernel code. A similar project tvdcn also exists which has adapted the raw 2D CUDA kernel operations to 1D and 3D operations: https://github.com/inspiros/tvdcn. I decided to pursue this alternate implementation anyway for the aforementioned implict tensor reshaping mentioned above.
-
-The implementation here is written entirely in python. Interestingly it operates faster when you have offsets for every position in a sequence, every channel and every kernel position as opposed to just every kernel position. This is most likely due to unintuitive Tensor operations on $\mathbb{R}^{\ldots \times 1 \times \ldots}$ shaped Tensors where it is looping rather than copying data and performing a multiprocessed operation (just my hunch). I'll look at this in future if PyTorch still haven't implemented their own 1D deformable convolution.
