@@ -74,7 +74,7 @@ to compare the runtime of our ```DeformConv1d``` layer against ```torch.nn.Conv1
 A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes the offsets using a depthwise separable convolutionoperation as detailed in our paper below 
 
 # Papers
-Please cite the following if you use this package4
+Please cite the following if you use this package
 ```
 @article{ravenscroft2022dtcn,
   title={Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation},
