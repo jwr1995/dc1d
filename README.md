@@ -12,6 +12,12 @@ This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on W
 ```
 pip install dc1d
 ```
+or
+```
+git clone https://github.com/jwr1995/dc1d.git
+cd dc1d
+pip install .
+```
 
 # Usage
 ## Example of how to use the deformable convolutional layer ```DeformConv1d()``` with timing information.
