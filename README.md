@@ -4,7 +4,7 @@ An 1D implementation of a deformable convolutional layer implemented in pure Pyt
 The motivation for creating this toolkit is as of 19/10/2022 there is no native 1D implementation of deformable convolution in the PyTorch library and no alternate library which is simple to install (requiring only a basic PyTorch installation with no additional compilation of c++ or cuda libraries). The implementation here is written entirely in Python and makes use of ```torch.autograd``` for backpropagation.
 
 # Requirements
-You must install PyTorch. Follow the details on the website to install properly: https://pytorch.org/get-started/locally/
+You must install PyTorch. Follow the details on the website to install properly: https://pytorch.org/get-started/locally/.
 
 This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on Windows with Python version 3.8. It has also been tested on Ubuntu, Zorin OS and CentOS all running Python 3.8.
 
@@ -79,7 +79,7 @@ python dc1d/nn.py
 ```
 to compare the runtime of our ```DeformConv1d``` layer against ```torch.nn.Conv1d```.
 
-A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes the offsets using a depthwise separable convolutionoperation as detailed in our paper below 
+A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes the offsets using a depthwise-separable convolutional block as detailed in our paper below.
 
 # Papers
 Please cite the following if you use this package
