@@ -6,7 +6,7 @@ The motivation for creating this toolkit is as of 19/10/2022 there is no native 
 # Requirements
 You must install PyTorch. Follow the details on the website to install properly: https://pytorch.org/get-started/locally/
 
-This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on Windows with Python version 3.8.
+This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on Windows with Python version 3.8. It has also been tested on Ubuntu, Zorin OS and CentOS all running Python 3.8.
 
 # Installation
 ```
