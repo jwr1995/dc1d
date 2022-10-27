@@ -1,6 +1,8 @@
 # dc1d (DeformConv1d)
 An 1D implementation of a deformable convolutional layer implemented in pure Python in PyTorch. The code style is designed to imitate similar classes in PyTorch such as ```torch.nn.Conv1D``` and ```torchvision.ops.DeformConv2D```.
 
+The motivation for creating this toolkit is as of 19/10/2022 there is no native 1D implementation of deformable convolution in the PyTorch library and no alternate library which is simple to install (requiring only a basic PyTorch installation with no additional compilation of c++ or cuda libraries). The implementation here is written entirely in Python and makes use of ```torch.autograd``` for backpropagation.
+
 # Requirements
 You must install PyTorch. Follow the details on the website to install properly: https://pytorch.org/get-started/locally/
 
