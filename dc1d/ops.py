@@ -201,18 +201,19 @@ def efficient_linterpolate(
         print("dilated_offsets_repeated:",dilated_offsets_repeated.shape)
         print("T:",T.shape) # batch_size x groups x out_length x kernel_rfield
 
-    U = torch.floor(T).to(torch.long) # 1 x 1 x length x kernel_rfield
-    U = torch.clamp(U,min=0,max=x.shape[2]-2)
+    with torch.no_grad():
+        U = torch.floor(T).to(torch.long) # 1 x 1 x length x kernel_rfield
+        U = torch.clamp(U,min=0,max=x.shape[2]-2)
 
-    if _test:
-        print("U:",U.shape)
-        # print("U_ceil:",U.shape)
+        if _test:
+            print("U:",U.shape)
+            # print("U_ceil:",U.shape)
 
-    U = torch.stack([U,U+1],dim=-1)
-    if U.shape[1] < x.shape[1]:
-        U=U.repeat(1,x.shape[1],1,1,1)
-    if _test:
-        print("U:", U.shape)
+        U = torch.stack([U,U+1],dim=-1)
+        if U.shape[1] < x.shape[1]:
+            U=U.repeat(1,x.shape[1],1,1,1)
+        if _test:
+            print("U:", U.shape)
 
     x=x.unsqueeze(-1).repeat(1,1,1,U.shape[-1])
     x = torch.stack([x.gather(index=U[:,:,:,i,:],dim=-2) for i in range(U.shape[-2])],dim=-1)

@@ -399,6 +399,8 @@ if __name__ == '__main__':
     z = torch.mean(y)
     z.backward(retain_graph=True)
 
+    ### Do any grad checking here if required ###
+
     vanilla_model = nn.Conv1d(
         in_channels = in_channels,
         out_channels = out_channels,
