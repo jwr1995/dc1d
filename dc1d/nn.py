@@ -8,6 +8,7 @@ Copyright SpeechBrain 2022.
 
 The reset_paramters functions were adapted from the PyTorch ConvNd classes:
 https://pytorch.org/docs/stable/_modules/torch/nn/modules/conv.html#Conv1d
+See licence here: https://github.com/pytorch/pytorch/blob/master/LICENSE
 Copyright 2022, PyTorch Contributors.
 
 The remainder of this module is original code belonging to the dc1d project.
@@ -45,6 +46,7 @@ class DeformConv1d(nn.Module):
         padding_mode: str = "reflect",
         device: str = "cpu",
         interpolation_function: Callable = efficient_linterpolate,
+        unconstrained: str = None, # default None to maintain backwards compatibility
         *args,
         **kwargs
         ) -> None:
@@ -108,6 +110,9 @@ class DeformConv1d(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        if not unconstrained==None:
+            self.unconstrained=unconstrained
+
         self.reset_parameters()
         self.to(device)
 
@@ -147,15 +152,28 @@ class DeformConv1d(nn.Module):
             self.device = offsets.device
         if self.dilated_positions.device != self.device:
             self.dilated_positions = self.dilated_positions.to(offsets.device)
-        input = self.interpolation_function(
-            input, 
-            kernel_size=self.kernel_size, 
-            dilation=self.dilation,
-            offsets=offsets, 
-            stride=self.stride,
-            dilated_positions=self.dilated_positions,
-            device=self.device
-            ) 
+
+        if "unconstrained" in self.__dict__.keys():
+            input = self.interpolation_function(
+                input, 
+                kernel_size=self.kernel_size, 
+                dilation=self.dilation,
+                offsets=offsets, 
+                stride=self.stride,
+                dilated_positions=self.dilated_positions,
+                device=self.device,
+                unconstrained=self.unconstrained
+                )
+        else:
+            input = self.interpolation_function(
+                input, 
+                kernel_size=self.kernel_size, 
+                dilation=self.dilation,
+                offsets=offsets, 
+                stride=self.stride,
+                dilated_positions=self.dilated_positions,
+                device=self.device
+                ) 
         input = input.flatten(-2,-1)
         output=F.conv1d(input, 
             self.weight, 
@@ -180,6 +198,7 @@ class PackedDeformConv1d(DeformConv1d):
         offset_groups: int = 1,
         device: str = "cpu",
         interpolation_function: Callable = efficient_linterpolate,
+        unconstrained: str = None, # default None to maintain backwards compatibility
         *args,
         **kwargs
         ) -> None:
@@ -212,6 +231,7 @@ class PackedDeformConv1d(DeformConv1d):
             padding_mode = padding_mode,
             device = device,
             interpolation_function = interpolation_function,
+            unconstrained=unconstrained,
             *args,
             **kwargs
             )
@@ -224,8 +244,6 @@ class PackedDeformConv1d(DeformConv1d):
         self.offset_pconv = nn.Conv1d(in_channels,kernel_size*offset_groups,1,stride=1,bias=False)
         self.odp_norm = gLN(kernel_size*offset_groups)
         self.odp_prelu = nn.PReLU()
-        
-        # self.offset_pconv_test = nn.Conv1d(in_channels,kernel_size*offset_groups,1,stride=1,bias=False)
 
         self.device=device
         self.to(device)
@@ -367,31 +385,50 @@ if __name__ == '__main__':
     groups = 512
     bias = True
     length = 1998
+    packed = False
 
-    model = PackedDeformConv1d(
-        in_channels = in_channels,
-        out_channels = out_channels,
-        kernel_size = kernel_size,
-        stride = stride,
-        padding = "same",
-        dilation = dilation,
-        groups = groups,
-        bias = True,
-        offset_groups=in_channels,
-        device="cuda"
-    )
+    if packed:
+        model = PackedDeformConv1d(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            stride = stride,
+            padding = "same",
+            dilation = dilation,
+            groups = groups,
+            bias = True,
+            offset_groups=in_channels,
+            unconstrained=True,
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+    else:
+        model = DeformConv1d(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            stride = stride,
+            padding = "same",
+            dilation = dilation,
+            groups = groups,
+            bias = True,
+            unconstrained=True,
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
 
-    x = torch.rand(batch_size, in_channels, length,requires_grad=True).cuda()
+    x = torch.rand(batch_size, in_channels, length,requires_grad=True, device='cuda' if torch.cuda.is_available() else 'cpu')
     print("Input shape",x.shape)
     
     output_length = x.shape[-1]-dilation*(kernel_size-1)
     
-    offsets = torch.ones(batch_size, 1, 1998, kernel_size, device="cuda", requires_grad=True)
+    offsets = nn.Parameter(torch.ones(batch_size, 1, 1998, kernel_size, device='cuda' if torch.cuda.is_available() else 'cpu', requires_grad=True))
     
     # Time DeformConv1d
     for i in range(3):
         start = time.time()  
-        y = model(x)
+        if type(model)==PackedDeformConv1d:
+            y = model(x)
+        else:
+            y = model(x,offsets)
         end = time.time()
         print(f"Deformable runtime #{i} = {end-start}s")
     print("Output shape",y.shape)
@@ -399,7 +436,9 @@ if __name__ == '__main__':
     z = torch.mean(y)
     z.backward(retain_graph=True)
 
-    ### Do any grad checking here if required ###
+    if not packed:
+        assert not offsets == None, "Offsets equal None... something has gone wrong"
+        print(offsets.grad) # check gradients are not none
 
     vanilla_model = nn.Conv1d(
         in_channels = in_channels,
@@ -411,7 +450,7 @@ if __name__ == '__main__':
         groups = groups,
         bias = True,
         padding_mode = "reflect",
-        device="cuda"
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     start = time.time()

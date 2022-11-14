@@ -9,6 +9,7 @@ Copyright William Ravenscroft 2022
 from multiprocessing.dummy import Pool
 import torch
 import torch.multiprocessing as mp
+# from torch.cuda.amp import autocast
 from functools import partial
 
 def full_seq_linterpolate(
@@ -177,21 +178,26 @@ def efficient_linterpolate(
     dilated_positions=None,
     device="cpu",
     _test=False,
-):
+    unconstrained=False
+):  
+
     assert x.device == offsets.device, "x and offsets must be on same device"
     kernel_rfield=dilation*(kernel_size-1)+1
     # Every index in x we need to consider
     if dilated_positions == None:
-        dilated_positions = torch.linspace(0, kernel_rfield-1,kernel_size,device=device) # kernel_size
-    
+        dilated_positions = torch.linspace(0, kernel_rfield-1,kernel_size,device=offsets.device,dtype=offsets.dtype) # kernel_size
+
     max_t0 = (offsets.shape[-2]-1)*stride
-    t0s = torch.linspace(0, max_t0, offsets.shape[-2],device=device).unsqueeze(-1) # out_length x 1
+    t0s = torch.linspace(0, max_t0, offsets.shape[-2],device=offsets.device,dtype=offsets.dtype).unsqueeze(-1) # out_length x 1
     dilated_offsets_repeated = dilated_positions+offsets
     
     T = t0s + dilated_offsets_repeated # batch_size x channels x out_length x kernel_size
-    T = torch.max(T, t0s)
-    T = torch.min(T, t0s+torch.max(dilated_positions))
-    
+    if not unconstrained:
+        T = torch.max(T, t0s)
+        T = torch.min(T, t0s+torch.max(dilated_positions))
+    else:
+        T = torch.clamp(T, 0.0, float(x.shape[-1]))
+
     if _test:
         print("x:",x.shape) # batch_size x in_channels x input_length
         print("offsets:",offsets.shape) # batch_size x groups x out_length x kernel_size
@@ -207,7 +213,6 @@ def efficient_linterpolate(
 
         if _test:
             print("U:",U.shape)
-            # print("U_ceil:",U.shape)
 
         U = torch.stack([U,U+1],dim=-1)
         if U.shape[1] < x.shape[1]:
@@ -219,11 +224,13 @@ def efficient_linterpolate(
     x = torch.stack([x.gather(index=U[:,:,:,i,:],dim=-2) for i in range(U.shape[-2])],dim=-1)
     
     G = torch.max(torch.zeros(U.shape,device=device), 1-torch.abs(U-T.unsqueeze(-1))) # batch_size x groups x out_length x kernel_rfield x kernel_size
+    
     if _test:
         print("G:",G.shape)
 
     mx = torch.multiply(G,x.moveaxis(-2,-1))
-    return torch.sum(mx, axis=-1)  # batch_size x channels x output_length x kernel size
+    
+    return torch.sum(mx, axis=-1) # .float()  # batch_size x channels x output_length x kernel size
    
 
 if __name__ == '__main__':
@@ -240,13 +247,13 @@ if __name__ == '__main__':
     torch.random.manual_seed(1234)
 
     # Input tensor
-    x = torch.rand(batch_size, channels, length,requires_grad=True)
+    x = torch.rand(batch_size, channels, length,requires_grad=True,device='cuda' if torch.cuda.is_available() else 'cpu')
     
     # Compute required number of offsets in the temporal direction (sequential length)
     # Uses delay/offset of 1 to test sample offset. Just edit to "2*torch.ones(..." for shift of 2 and so on
     num_samples = (x.shape[-1]-dilation*(kernel_size-1))//stride
     final_idx = (num_samples-1)*stride
-    offsets = -0.5*torch.ones(batch_size, groups, num_samples, kernel_size)
+    offsets = -0.5*torch.ones(batch_size, groups, num_samples, kernel_size,device='cuda' if torch.cuda.is_available() else 'cpu')
     
     # Compute interpolated offset positions of x
     # x_offset = full_seq_linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
@@ -261,7 +268,10 @@ if __name__ == '__main__':
     #     print(f"Output {x_offset.shape}:",x_offset)
 
     start=time.time()
-    x_offset = efficient_linterpolate(x, offsets, kernel_size, dilation, stride, _test=_test) # batch_size, in channels,output seq. length, kernel size
+    x_offset = efficient_linterpolate(x, offsets, 
+                kernel_size, dilation, stride,
+                unconstrained=False,
+                _test=_test,device='cuda' if torch.cuda.is_available() else 'cpu') # batch_size, in channels,output seq. length, kernel size
     stop=time.time()
     print("Ellapsed:",stop-start,"s")
     # View results
