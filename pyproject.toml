@@ -19,5 +19,5 @@ classifiers = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/jwr1995/DeformConv1d"
-"Bug Tracker" = "https://github.com/jwr1995/DeformConv1d/issues"
+"Homepage" = "https://github.com/jwr1995/dc1d"
+"Bug Tracker" = "https://github.com/jwr1995/dc1d/issues"
