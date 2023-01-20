@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
-from torch.nn.modules.utils import _reverse_repeat_tuple
+from torch.nn.modules.utils import _single, _reverse_repeat_tuple
 from typing import Callable
 
 # dc1d
@@ -67,27 +67,43 @@ class DeformConv1d(nn.Module):
 
         self.device = device
         self.interpolation_function = interpolation_function
+        padding_ = padding if isinstance(padding, str) else _single(padding)
         
         super(DeformConv1d, self).__init__(*args,**kwargs)
-
+        if groups <= 0:
+            raise ValueError('groups must be a positive integer')
         if in_channels % groups != 0:
             raise ValueError("in_channels must be divisible by groups")
         if out_channels % groups != 0:
             raise ValueError("out_channels must be divisible by groups")
+        valid_padding_strings = {'same', 'valid'}
+        if isinstance(padding, str):
+            if padding not in valid_padding_strings:
+                raise ValueError(
+                    "Invalid padding string {!r}, should be one of {}".format(
+                        padding, valid_padding_strings))
+            if padding == 'same' and any(s != 1 for s in stride):
+                raise ValueError("padding='same' is not supported for strided convolutions")
 
+        valid_padding_modes = {'zeros', 'reflect', 'replicate', 'circular'}
+        if padding_mode not in valid_padding_modes:
+            raise ValueError("padding_mode must be one of {}, but got padding_mode='{}'".format(
+                valid_padding_modes, padding_mode))
+                
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.stride = stride
-        self.padding = padding
+        self.padding = padding_ # note this is tuple-like for compatibility
         self.dilation = dilation
         self.groups = groups
         self.padding_mode = padding_mode
 
         if isinstance(self.padding, str):
-            self._reversed_padding_repeated_twice = [0, 0]
+            self._reversed_padding_repeated_twice = [0, 0] * len(kernel_size)
             if padding == 'same':
-                for d, k, i in zip([dilation], [kernel_size], range( 0, -1, -1)):
+                for d, k, i in zip(dilation, kernel_size,
+                                   range(len(kernel_size) - 1, -1, -1)):
                     total_padding = d * (k - 1)
                     left_pad = total_padding // 2
                     self._reversed_padding_repeated_twice[2 * i] = left_pad
@@ -97,7 +113,7 @@ class DeformConv1d(nn.Module):
             self._reversed_padding_repeated_twice = _reverse_repeat_tuple(self.padding, 2)
 
         self.weight = Parameter(
-            torch.empty(out_channels, in_channels // groups, self.kernel_size)
+            torch.empty(out_channels, in_channels // groups, kernel_size)
         )
 
         self.dilated_positions = torch.linspace(0,
@@ -123,6 +139,29 @@ class DeformConv1d(nn.Module):
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(fan_in)
             init.uniform_(self.bias, -bound, bound)
+    
+    def extra_repr(self):
+        s = ('{in_channels}, {out_channels}, kernel_size={kernel_size}'
+             ', stride={stride}')
+        if self.padding != (0,) * len(self.padding):
+            s += ', padding={padding}'
+        if self.dilation != (1,) * len(self.dilation):
+            s += ', dilation={dilation}'
+        if self.output_padding != (0,) * len(self.output_padding):
+            s += ', output_padding={output_padding}'
+        if self.groups != 1:
+            s += ', groups={groups}'
+        if self.bias is None:
+            s += ', bias=False'
+        if self.padding_mode != 'zeros':
+            s += ', padding_mode={padding_mode}'
+        return s.format(**self.__dict__)
+    
+    def __setstate__(self, state):
+        super(DeformConv1d, self).__setstate__(state)
+        if not hasattr(self, 'padding_mode'):
+            self.padding_mode = 'zeros'
+
 
     def forward(
         self, 
@@ -385,7 +424,7 @@ if __name__ == '__main__':
     groups = 512
     bias = True
     length = 1998
-    packed = False
+    packed = True
 
     if packed:
         model = PackedDeformConv1d(
@@ -393,7 +432,7 @@ if __name__ == '__main__':
             out_channels = out_channels,
             kernel_size = kernel_size,
             stride = stride,
-            padding = "same",
+            padding = (kernel_size - 1) // 2, # "same",
             dilation = dilation,
             groups = groups,
             bias = True,

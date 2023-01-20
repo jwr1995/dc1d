@@ -13,3 +13,4 @@ dc1d/__pycache__/
 core.*
 build_upload_test.sh
 build_upload.sh
+**/*.txt
