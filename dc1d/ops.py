@@ -1,5 +1,5 @@
 """ 
-ops.py provides operation functions for defomrable convolution
+ops.py provides linear interpolation operation functions for deformable convolution
 
 Author: William Ravenscroft, August 2022
 Copyright William Ravenscroft 2022
