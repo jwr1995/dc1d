@@ -68,6 +68,9 @@ class DeformConv1d(nn.Module):
         self.device = device
         self.interpolation_function = interpolation_function
         padding_ = padding if isinstance(padding, str) else _single(padding)
+        stride_ = _single(stride)
+        dilation_ = _single(dilation)
+        kernel_size_ = _single(kernel_size)
         
         super(DeformConv1d, self).__init__(*args,**kwargs)
         if groups <= 0:
@@ -82,7 +85,7 @@ class DeformConv1d(nn.Module):
                 raise ValueError(
                     "Invalid padding string {!r}, should be one of {}".format(
                         padding, valid_padding_strings))
-            if padding == 'same' and any(s != 1 for s in stride):
+            if padding == 'same' and any(s != 1 for s in stride_):
                 raise ValueError("padding='same' is not supported for strided convolutions")
 
         valid_padding_modes = {'zeros', 'reflect', 'replicate', 'circular'}
@@ -100,10 +103,10 @@ class DeformConv1d(nn.Module):
         self.padding_mode = padding_mode
 
         if isinstance(self.padding, str):
-            self._reversed_padding_repeated_twice = [0, 0] * len(kernel_size)
+            self._reversed_padding_repeated_twice = [0, 0] * len(kernel_size_)
             if padding == 'same':
-                for d, k, i in zip(dilation, kernel_size,
-                                   range(len(kernel_size) - 1, -1, -1)):
+                for d, k, i in zip(dilation_, kernel_size_,
+                                   range(len(kernel_size_) - 1, -1, -1)):
                     total_padding = d * (k - 1)
                     left_pad = total_padding // 2
                     self._reversed_padding_repeated_twice[2 * i] = left_pad
@@ -162,7 +165,6 @@ class DeformConv1d(nn.Module):
         if not hasattr(self, 'padding_mode'):
             self.padding_mode = 'zeros'
 
-
     def forward(
         self, 
         input: Tensor, 
@@ -180,12 +182,19 @@ class DeformConv1d(nn.Module):
         Returns:
             output (Tensor[batch_size, in_channels, length]): output tensor
         """
-        
+        in_shape = input.shape
         if self.padding_mode != 'zeros':
             input = F.pad(
                 input, 
                 self._reversed_padding_repeated_twice, 
                 mode=self.padding_mode
+                )
+        elif self.padding == 'same':
+            input = F.pad(
+                input, 
+                self._reversed_padding_repeated_twice, 
+                mode='constant', 
+                value=0
                 )
         if not self.device == offsets.device: # naive assumption
             self.device = offsets.device
@@ -220,7 +229,8 @@ class DeformConv1d(nn.Module):
             stride=self.kernel_size, 
             groups=self.groups
             )
-
+        if self.padding == 'same':
+            assert in_shape[-1] == output.shape[-1], f"input length {in_shape[-1]} and output length {output.shape[-1]} do not match."
         return output
 
 class PackedDeformConv1d(DeformConv1d):
@@ -423,7 +433,7 @@ if __name__ == '__main__':
     dilation = 2^7
     groups = 512
     bias = True
-    length = 1998
+    length = 133
     packed = True
 
     if packed:
@@ -432,7 +442,7 @@ if __name__ == '__main__':
             out_channels = out_channels,
             kernel_size = kernel_size,
             stride = stride,
-            padding = (kernel_size - 1) // 2, # "same",
+            padding =  padding, # (kernel_size - 1) // 2,
             dilation = dilation,
             groups = groups,
             bias = True,
@@ -446,7 +456,7 @@ if __name__ == '__main__':
             out_channels = out_channels,
             kernel_size = kernel_size,
             stride = stride,
-            padding = "same",
+            padding = padding,
             dilation = dilation,
             groups = groups,
             bias = True,
@@ -484,7 +494,7 @@ if __name__ == '__main__':
         out_channels = out_channels,
         kernel_size = kernel_size,
         stride = stride,
-        # padding = "zeros",
+        padding = padding,
         dilation = dilation,
         groups = groups,
         bias = True,
