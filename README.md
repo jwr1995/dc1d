@@ -9,15 +9,19 @@ You must install PyTorch. Follow the details on the website to install properly:
 This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on Windows with Python version 3.8. It has also been tested on Ubuntu, Zorin OS and CentOS all running Python 3.8.
 
 # Installation
+Please use the following ```pip``` command to install for now
 ```
-pip install dc1d
+pip install dc1d==0.0.4
 ```
-or
+!!! Do not install from source as the latest version on this branch has been found to be unstable and requires further investigation!
+<!---
+% or
 ```
 git clone https://github.com/jwr1995/dc1d.git
 cd dc1d
 pip install .
 ```
+-->
 
 # Usage
 ## Example of how to use the deformable convolutional layer ```DeformConv1d()``` with timing information.
