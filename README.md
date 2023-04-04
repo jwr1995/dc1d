@@ -89,12 +89,10 @@ A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes th
 Please cite the following if you use this package
 ```
 @misc{ravenscroft2022dtcn,
-  doi = {10.48550/ARXIV.2210.15305},
-  url = {https://arxiv.org/abs/2210.15305},
   author = {Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
   title = {Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation},
-  publisher = {arXiv},
-  year = {2022},
-  copyright = {Creative Commons Attribution 4.0 International}
+  booktitle = {ICASSP 2023},
+  year = {2023},
+  month = {June}
 }
 ```
