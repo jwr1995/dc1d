@@ -96,11 +96,13 @@ A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes th
 # Papers
 Please cite the following if you use this package
 ```
-@misc{ravenscroft2022dtcn,
-  author = {Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
-  title = {Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation},
-  booktitle = {ICASSP 2023},
-  year = {2023},
-  month = {June}
-}
+@INPROCEEDINGS{dtcn23,
+  author={Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
+  booktitle={ICASSP 2023 - 2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 
+  title={Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation}, 
+  year={2023},
+  volume={},
+  number={},
+  pages={1-5},
+  doi={10.1109/ICASSP49357.2023.10095230}}
 ```
