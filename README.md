@@ -38,6 +38,8 @@ Note: ```DeformConv1d``` does not compute the offset values used in its ```forwa
 
 ```
 import time
+import torch
+from torch import nn
 
 # Import layer
 from dc1d.nn import DeformConv1d
@@ -64,16 +66,14 @@ model = DeformConv1d(
     dilation = dilation,
     groups = groups,
     bias = True,
-    device="cuda"
 )
 
 # Generate input sequence
-x = torch.rand(batch_size, in_channels, length,requires_grad=True).cuda()
+x = torch.rand(batch_size, in_channels, length,requires_grad=True)
 print(x.shape)
 
 # Generate offsets by first computing the desired output length
-output_length = x.shape[-1]-dilation*(kernel_size-1)
-offsets = nn.Parameter(torch.ones(batch_size, 1, output_length, kernel_size, requires_grad=True, device="cuda"))
+offsets = nn.Parameter(torch.ones(batch_size, 1, length, kernel_size, requires_grad=True))
 
 # Process the input sequence and time it
 start = time.time()

@@ -31,7 +31,7 @@ from torch.nn.modules.utils import _single, _reverse_repeat_tuple
 from typing import Callable
 
 # dc1d
-from dc1d.ops import kernel_width_linterpolate, full_seq_linterpolate, efficient_linterpolate
+from dc1d.ops import kernel_width_linterpolate, full_seq_linterpolate, efficient_linterpolate, deform_conv1d
 
 class DeformConv1d(nn.Module):
     def __init__(self,
@@ -230,7 +230,7 @@ class DeformConv1d(nn.Module):
             groups=self.groups
             )
         if self.padding == 'same':
-            assert in_shape[-1] == output.shape[-1], f"input length {in_shape[-1]} and output length {output.shape[-1]} do not match."
+            assert in_shape[-1] == output.shape[-1], f"input length {in_shape} and output length {output.shape} do not match."
         return output
 
 class PackedDeformConv1d(DeformConv1d):
@@ -434,7 +434,7 @@ if __name__ == '__main__':
     groups = 512
     bias = True
     length = 133
-    packed = True
+    packed = False
 
     if packed:
         model = PackedDeformConv1d(
@@ -469,7 +469,7 @@ if __name__ == '__main__':
     
     output_length = x.shape[-1]-dilation*(kernel_size-1)
     
-    offsets = nn.Parameter(torch.ones(batch_size, 1, 1998, kernel_size, device='cuda' if torch.cuda.is_available() else 'cpu', requires_grad=True))
+    offsets = nn.Parameter(torch.ones(batch_size, 1, length, kernel_size, device='cuda' if torch.cuda.is_available() else 'cpu', requires_grad=True))
     
     # Time DeformConv1d
     for i in range(3):
