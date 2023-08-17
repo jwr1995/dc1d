@@ -11,25 +11,22 @@ This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on W
 # Installation
 Please use the following ```pip``` command to install for now.
 
-Most stable (only one padding type is implemented on this version):
-```
-pip install dc1d==0.0.2
-```
-
-Experimental:
+Most thoroughly tested version (only "reflect" padding mode is implemented on this version, please do not try to use any other):
 ```
 pip install dc1d==0.0.4
 ```
-
-!!! Do not install from source as the latest version on this branch has been found to be unstable and requires further investigation!
-<!---
-% or
+Alternatively to install the latest version do
+```
+pip install dc1d
+```
+The current version on this branch has not been tested for numerical accuracy but probably works fine. Gradient computation has been tested and seems okay.
+To download direct from source do
 ```
 git clone https://github.com/jwr1995/dc1d.git
 cd dc1d
 pip install .
 ```
--->
+
 
 # Usage
 ## Example of how to use the deformable convolutional layer ```DeformConv1d()``` with timing information.
