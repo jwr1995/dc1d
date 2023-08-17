@@ -196,6 +196,8 @@ class DeformConv1d(nn.Module):
                 mode='constant', 
                 value=0
                 )
+            
+            
         if not self.device == offsets.device: # naive assumption
             self.device = offsets.device
         if self.dilated_positions.device != self.device:

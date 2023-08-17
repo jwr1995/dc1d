@@ -14,4 +14,3 @@ core.*
 build_upload_test.sh
 build_upload.sh
 **/*.txt
-playground/
