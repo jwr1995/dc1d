@@ -47,7 +47,7 @@ in_channels = 512
 out_channels = 512
 kernel_size = 16
 stride = 1
-padding = "same"
+padding = "valid"
 dilation = 3
 groups = 1
 bias = True
@@ -59,7 +59,7 @@ model = DeformConv1d(
     out_channels = out_channels,
     kernel_size = kernel_size,
     stride = stride,
-    padding = "same",
+    padding = padding,
     dilation = dilation,
     groups = groups,
     bias = True,
@@ -70,7 +70,8 @@ x = torch.rand(batch_size, in_channels, length,requires_grad=True)
 print(x.shape)
 
 # Generate offsets by first computing the desired output length
-offsets = nn.Parameter(torch.ones(batch_size, 1, length, kernel_size, requires_grad=True))
+output_length = x.shape[-1]-dilation*(kernel_size-1)
+offsets = nn.Parameter(torch.ones(batch_size, 1, output_length, kernel_size, requires_grad=True))
 
 # Process the input sequence and time it
 start = time.time()
