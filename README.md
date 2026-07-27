@@ -1,44 +1,57 @@
 # dc1d (DeformConv1d)
-A 1D implementation of a deformable convolutional layer implemented in pure Python in PyTorch. The code style is designed to imitate similar classes in PyTorch such as ```torch.nn.Conv1D``` and ```torchvision.ops.DeformConv2D```.
 
-The motivation for creating this toolkit is as of 19/10/2022 there is no native 1D implementation of deformable convolution in the PyTorch library and no alternate library which is simple to install (requiring only a basic PyTorch installation with no additional compilation of c++ or cuda libraries). The implementation here is written entirely in Python and makes use of ```torch.autograd``` for backpropagation.
+A 1D implementation of a deformable convolutional layer implemented in pure Python in PyTorch. The code style is designed to imitate similar classes in PyTorch such as `torch.nn.Conv1d` and `torchvision.ops.DeformConv2d`.
 
-# Requirements
-You must install PyTorch. Follow the details on the website to install properly: https://pytorch.org/get-started/locally/.
+The motivation for creating this toolkit is that (as of 19/10/2022) there is no native 1D implementation of deformable convolution in the PyTorch library, and no alternative library which is simple to install (requiring only a basic PyTorch installation, with no additional compilation of C++ or CUDA libraries). The implementation here is written entirely in Python and makes use of `torch.autograd` for backpropagation.
 
-This package was most thoroughly tested on PyTorch 1.12.1 running CUDA 11.6 on Windows with Python version 3.8. It has also been tested on Ubuntu, Zorin OS and CentOS all running Python 3.8.
+## Requirements
 
-# Installation
-Please use the following ```pip``` command to install for now.
+* Python >= 3.10
+* PyTorch >= 2.4 (installed automatically as a dependency)
 
-Most thoroughly tested version (only "reflect" padding mode is implemented on this version, please do not try to use any other):
-```
-pip install dc1d==0.0.4
-```
-Alternatively to install the latest version do
+`torchvision` is **not** required. Earlier releases imported private torchvision
+symbols at module scope for a dead code path; that path has been removed.
+
+Install PyTorch for your platform/CUDA version first if you want a specific
+build: https://pytorch.org/get-started/locally/.
+
+## Installation
+
 ```
 pip install dc1d
 ```
-The current version on this branch has not been tested for numerical accuracy but probably works fine. Gradient computation has been tested and seems okay.
-To download direct from source do
+
+Or from source:
+
 ```
 git clone https://github.com/jwr1995/dc1d.git
 cd dc1d
 pip install .
 ```
 
+### Development
 
-# Usage
-## Example of how to use the deformable convolutional layer ```DeformConv1d()``` with timing information.
-```DeformConv1d``` is the deformable convolution layer designed to imitate ```torch.nn.Conv1d```.
-Note: ```DeformConv1d``` does not compute the offset values used in its ```forward(...)``` call. These most be computed outside the layer.
+The project is managed with [uv](https://docs.astral.sh/uv/):
 
 ```
-import time
+uv sync            # creates .venv with CPU-only torch and the dev tools
+uv run pytest      # run the test suite
+uv run ruff check .
+uv run ruff format --check .
+```
+
+## Usage
+
+### `DeformConv1d`
+
+`DeformConv1d` is the deformable convolution layer designed to imitate `torch.nn.Conv1d`.
+
+Note: `DeformConv1d` does **not** compute the offset values used in its `forward(...)` call. These must be computed outside the layer. Use `PackedDeformConv1d` if you want the offsets computed for you.
+
+```python
 import torch
 from torch import nn
 
-# Import layer
 from dc1d.nn import DeformConv1d
 
 # Hyperparameters
@@ -50,54 +63,80 @@ stride = 1
 padding = "valid"
 dilation = 3
 groups = 1
-bias = True
 length = 128
 
 # Construct layer
 model = DeformConv1d(
-    in_channels = in_channels,
-    out_channels = out_channels,
-    kernel_size = kernel_size,
-    stride = stride,
-    padding = padding,
-    dilation = dilation,
-    groups = groups,
-    bias = True,
+    in_channels=in_channels,
+    out_channels=out_channels,
+    kernel_size=kernel_size,
+    stride=stride,
+    padding=padding,
+    dilation=dilation,
+    groups=groups,
+    bias=True,
 )
 
-# Generate input sequence
-x = torch.rand(batch_size, in_channels, length,requires_grad=True)
-print(x.shape)
+x = torch.rand(batch_size, in_channels, length, requires_grad=True)
 
-# Generate offsets by first computing the desired output length
-output_length = x.shape[-1]-dilation*(kernel_size-1)
-offsets = nn.Parameter(torch.ones(batch_size, 1, output_length, kernel_size, requires_grad=True))
+# Number of offset positions required. This is the same closed form nn.Conv1d
+# uses; forward() raises if the offset tensor disagrees with it.
+output_length = model.expected_offset_positions(length)
+offsets = nn.Parameter(torch.ones(batch_size, 1, output_length, kernel_size))
 
-# Process the input sequence and time it
-start = time.time()
-y = model(x, offsets)
-end = time.time()
-
-# Print output shape and time taken
-print(y.shape)
-print("Deformable runtime =",end-start)
+y = model(x, offsets)  # [batch_size, out_channels, output_length]
 ```
----
-For more detailed examples, the ```nn``` and ```ops``` modules have example usage scripts appended to the bottom of the file inside their ```if __name__ == "__main__":``` clauses. For example one could run 
-```
-python dc1d/nn.py
-```
-to compare the runtime of our ```DeformConv1d``` layer against ```torch.nn.Conv1d```.
 
-A class called ```PackedConv1d``` also exists in ```dc1d.nn``` which computes the offsets using a depthwise-separable convolutional block as detailed in our paper below.
+The offset tensor has shape `[batch_size, offset_groups, output_length, kernel_size]`,
+where `offset_groups` may be `1` or any divisor of `in_channels`.
 
-# Papers
-Please cite the following if you use this package
+By default each kernel tap is constrained to its own receptive field. Pass
+`unconstrained=True` to let taps sample anywhere in the sequence.
+
+### `PackedDeformConv1d`
+
+`PackedDeformConv1d` computes the offsets internally using a depthwise-separable
+convolutional block, as detailed in the paper below.
+
+```python
+import torch
+from dc1d.nn import PackedDeformConv1d
+
+model = PackedDeformConv1d(
+    in_channels=64,
+    out_channels=64,
+    kernel_size=3,
+    dilation=4,
+    groups=64,
+    offset_groups=64,
+    padding="same",
+)
+y = model(torch.rand(4, 64, 256))
+# y, offsets = model(x, with_offsets=True)  # if you want the offsets too
+```
+
+### Examples and benchmarks
+
+```
+python playground/readme_example.py     # the snippet above
+python playground/param_example.py      # large-dilation depthwise example
+python benchmarks/benchmark.py          # timings (add --device cuda for GPU)
+```
+
+The benchmarks use `torch.utils.benchmark.Timer`, which warms up both paths
+equally and synchronises CUDA around the timed region. Timings printed by
+earlier versions of this repo (a bare `time.time()` around an async CUDA launch,
+with warmup for the deformable path only) were not meaningful.
+
+## Papers
+
+Please cite the following if you use this package:
+
 ```
 @INPROCEEDINGS{dtcn23,
   author={Ravenscroft, William and Goetze, Stefan and Hain, Thomas},
-  booktitle={ICASSP 2023 - 2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 
-  title={Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation}, 
+  booktitle={ICASSP 2023 - 2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  title={Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation},
   year={2023},
   volume={},
   number={},
