@@ -4,20 +4,80 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dc1d"
-version = "0.0.7"
+dynamic = ["version"]
 authors = [
   { name="William Ravenscroft", email="jwravenscroft1@sheffield.ac.uk" },
 ]
 description = "A PyTorch implementation of 1D deformable convolution"
 readme = "README.md"
 license = { file="LICENSE" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/jwr1995/dc1d"
 "Bug Tracker" = "https://github.com/jwr1995/dc1d/issues"
+
+[tool.hatch.version]
+path = "dc1d/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dc1d"]
+
+[tool.hatch.build.targets.sdist]
+include = ["dc1d", "tests", "README.md", "LICENSE"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# ---------------------------------------------------------------------------
+# CPU-only torch for the development environment. The published wheel keeps a
+# plain `torch>=2.4` dependency (see [project.dependencies]); this section only
+# affects `uv sync` / `uv run` in this checkout.
+# ---------------------------------------------------------------------------
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "W",    # pycodestyle warnings
+]
+ignore = [
+    "E741",  # ambiguous variable names -- signal-processing maths uses `l`
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

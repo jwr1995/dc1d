@@ -1,16 +1,26 @@
-dc1d/__pycache__/__init__.cpython-38.pyc
-dc1d/__pycache__/__init__.cpython-39.pyc
-dc1d/__pycache__/nnet.cpython-38.pyc
-dc1d/__pycache__/nnet.cpython-39.pyc
-dc1d/__pycache__/ops.cpython-38.pyc
-dc1d.egg-info/dependency_links.txt
-dc1d.egg-info/entry_points.txt
-dc1d.egg-info/PKG-INFO
-dc1d.egg-info/SOURCES.txt
-dc1d.egg-info/top_level.txt
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Build artefacts
+build/
 dist/
-dc1d/__pycache__/
+*.egg-info/
 core.*
+
+# Local build/upload helper scripts
 build_upload_test.sh
 build_upload.sh
-**/*.txt
+
+# Environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# NOTE: do NOT add a blanket `**/*.txt` rule here -- it silently swallowed
+# requirements.txt and any other .txt the project might need to track.
