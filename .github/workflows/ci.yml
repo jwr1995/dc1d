@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          python-version: ${{ matrix.python-version }}
+
+      # torch resolves to the CPU-only wheel index configured in pyproject.toml
+      # ([tool.uv.sources] + [[tool.uv.index]] pytorch-cpu), which is ~180 MB
+      # rather than the ~2.5 GB CUDA build. GitHub runners have no GPU anyway.
+      - name: Sync
+        run: uv sync --locked --python ${{ matrix.python-version }}
+
+      - name: Show environment
+        run: uv run --python ${{ matrix.python-version }} python -c "import sys, torch, dc1d; print(sys.version); print('torch', torch.__version__); print('dc1d', dc1d.__version__)"
+
+      - name: pytest
+        run: uv run --python ${{ matrix.python-version }} pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+      # Install the built wheel into a clean env and import it, so a missing
+      # runtime dependency (dc1d shipped with none until 2026) fails the build.
+      - name: Import from built wheel
+        run: |
+          uv venv /tmp/wheeltest
+          VIRTUAL_ENV=/tmp/wheeltest uv pip install \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            dist/*.whl
+          /tmp/wheeltest/bin/python -c "import dc1d; print(dc1d.__version__); import torch; print(torch.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

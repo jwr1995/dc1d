@@ -1,0 +1,96 @@
+# =============================================================================
+# SCAFFOLD -- NOT ACTIVE.
+#
+# This file is deliberately named `release.yml.disabled` so GitHub Actions does
+# not pick it up. Nothing here has been tested against PyPI and no secrets or
+# trusted-publisher configuration exist yet.
+#
+# To activate (see the "PyPI auto-release" section of TODO.md):
+#   1. Configure a PyPI Trusted Publisher for the `jwr1995/dc1d` repository
+#      pointing at workflow file `release.yml` and environment `pypi`.
+#      https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+#   2. Create a GitHub environment named `pypi` (optionally with a required
+#      reviewer, so a human approves every upload).
+#   3. Decide the tag convention. This scaffold assumes `v<version>` tags
+#      (e.g. `v0.1.0`) that match `dc1d/__init__.py:__version__`.
+#   4. `git mv .github/workflows/release.yml.disabled .github/workflows/release.yml`
+#   5. Test against TestPyPI first by flipping `repository-url` below.
+#
+# NO SECRETS ARE REQUIRED: trusted publishing uses OIDC, which is why the
+# `id-token: write` permission is present and no API token is referenced.
+# =============================================================================
+
+name: Release
+
+on:
+  # Left as workflow_dispatch-only on purpose. Add the `push: tags:` trigger
+  # below only once trusted publishing is configured and a dry run has passed.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+  # push:
+  #   tags:
+  #     - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Verify tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          uv sync --locked
+          PKG_VERSION=$(uv run python -c "import dc1d; print(dc1d.__version__)")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $TAG_VERSION does not match dc1d.__version__ $PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target || 'pypi' }}
+    permissions:
+      id-token: write # required for PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        if: inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI
+        if: inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
