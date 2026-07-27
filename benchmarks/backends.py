@@ -1,39 +1,49 @@
 """
-Three-way comparison of 1D deformable convolution backends:
+Comparison of every available 1D deformable convolution backend.
 
 1.  **dc1d** -- ``take_along_dim`` + ``lerp`` + ``conv1d``, pure
-    ``torch.autograd``, no compilation step. What the package ships today.
+    ``torch.autograd``, no compilation step. What the package ships today
+    (``dc1d.ops.efficient_linterpolate``).
 2.  **torchvision** -- ``torchvision.ops.deform_conv2d``, a hand-written
-    C++/CUDA kernel, degenerated to 1D (height 1).
+    C++/CUDA kernel, degenerated to 1D (height 1). The compiled-kernel
+    baseline.
 3.  **grid_sample** -- ``F.grid_sample`` on a degenerate ``(B, C, 1, L)``
-    image. A candidate future backend for dc1d: ``grid_sample`` is an ATen
-    builtin, so adopting it would preserve the "no compilation required"
-    property, and it is what at least one independent 1D implementation uses.
+    image, written here as a drop-in replacement for
+    ``efficient_linterpolate``. A candidate future backend for dc1d:
+    ``grid_sample`` is an ATen builtin (``torch.ops.aten.grid_sampler_2d``),
+    so adopting it would preserve the "no compilation required" property.
+4.  **tinymera** -- a *second, independently written* 1D deformable conv by the
+    same author, vendored in ``benchmarks/_tinymera_ref.py``. It ships two
+    kernels, ``grid_sample`` and ``gather``, and is included both as a
+    performance data point and as a defect cross-audit subject: same algorithm,
+    written twice, so correlated mistakes are likely.
 
-This script answers two questions:
+This script answers three questions:
 
 1.  **Are they the same operation?**  ``--check`` establishes numerical
-    equivalence (forward and backward) on the subset of the input domain where
-    both implementations are defined identically, and characterises the places
-    where they are *not* the same -- see "Semantics" below.
-2.  **How much does the compiled kernel win?**  ``--bench`` sweeps a grid of
+    equivalence (forward, d/d input, and d/d offsets) on the subset of the
+    input domain where the implementations are defined identically, and
+    characterises the places where they are *not* -- see "Semantics" below.
+2.  **Do the two repos share bugs?**  ``--defects`` runs the dc1d bug list as
+    executable probes against every backend. See ``benchmarks/BACKENDS.md``.
+3.  **How much does the compiled kernel win?**  ``--bench`` sweeps a grid of
     shapes with ``torch.utils.benchmark.Timer`` (forward and forward+backward
-    timed separately, equal warmup on both sides) and ``--mem`` measures peak
-    memory.
+    timed separately, equal warmup on all contenders) and ``--mem`` measures
+    peak memory.
 
 torchvision is *not* a dependency of dc1d and must not become one. Install it
 into a throwaway environment:
 
     # CPU
     uv sync --group bench
-    uv run --group bench python benchmarks/vs_torchvision.py --check
+    uv run --group bench python benchmarks/backends.py --check --defects
 
     # CUDA (separate venv -- the dev venv is CPU-only torch by design)
     uv venv --python 3.12 .venv-cuda
     VIRTUAL_ENV=.venv-cuda uv pip install --index-url https://download.pytorch.org/whl/cu129 \
         torch==2.13.0+cu129 torchvision==0.28.0+cu129
     VIRTUAL_ENV=.venv-cuda uv pip install -e . --no-deps
-    .venv-cuda/bin/python benchmarks/vs_torchvision.py --all --device cuda
+    .venv-cuda/bin/python benchmarks/backends.py --all --device cuda
 
 
 Degenerating 2D -> 1D
@@ -83,6 +93,16 @@ The ``grid_sample`` backend is written to match **dc1d**, not torchvision:
 boundaries too. It carries its own caveat -- see ``_grid_sample_precision_study``:
 the ``[-1, 1]`` grid normalisation is *lossy*, so unlike dc1d it cannot
 reproduce ``nn.Conv1d`` bit-for-bit once the sequence is long.
+
+**tinymera** uses the same clamp convention as dc1d (``padding_mode='border'``
+in its grid_sample kernel, ``pos.clamp(0, T_in - 1)`` in its gather kernel), so
+it should agree with dc1d everywhere, boundaries included. Its interface differs
+in one way that matters for the timings: ``offsets`` is always ``(B, C, T, K)``,
+i.e. ``offset_groups`` is hardwired to ``in_channels``. Where a config asks for
+fewer offset groups the offsets are broadcast up to ``C`` outside the timed
+region, so tinymera is never charged for the broadcast -- but it also never gets
+the memory saving that dc1d's ``offset_groups=1`` path enjoys, which is a real
+property of the design and not a benchmarking artefact.
 """
 
 from __future__ import annotations
@@ -101,7 +121,15 @@ import torch.utils.benchmark as benchmark
 from torch import Tensor, nn
 
 from dc1d.nn import DeformConv1d
-from dc1d.ops import output_length
+from dc1d.ops import efficient_linterpolate, output_length
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tinymera_ref import (  # noqa: E402, I001
+    deform_conv1d_gather as tm_gather,
+    deform_conv1d_grid_sample as tm_grid_sample,
+)
+
+TINYMERA_REF = "tinymera fix/causality @ 04593f38 (tinymera/ops/deform_conv1d.py)"
 
 try:
     import torchvision
@@ -209,29 +237,53 @@ def grid_sample_linterpolate(
     batch, channels, length = x.shape
     groups, out_length = offsets.shape[1], offsets.shape[-2]
     per_group = channels // groups
-    dtype = x.dtype
+
+    # ------------------------------------------------------------------
+    # Precision floor.
+    #
+    # Unlike `efficient_linterpolate`, this backend has no way to keep the
+    # window start in `long`: grid_sample's only input is a single normalised
+    # float coordinate, so the integer part and the fraction must share one
+    # mantissa. That makes the position arithmetic dtype-sensitive in exactly
+    # the way dc1d fixed -- and measurably so: at bf16 (8 mantissa bits) a
+    # naive version of this function reads the wrong samples entirely, with an
+    # error 5.9x the RMS of the signal at L = 16000 (see `audit_defects`
+    # probe 1). fp16 fares no better past ~2k.
+    #
+    # The mitigation, which tinymera's kernel also uses, is to force the
+    # position and sampling arithmetic to at least float32 and cast the result
+    # back. Any real adoption of a grid_sample backend must do this; a version
+    # that inherits the autocast dtype is a regression on a bug dc1d has
+    # already paid for once.
+    # ------------------------------------------------------------------
+    out_dtype = x.dtype
+    work = x.dtype if x.dtype in (torch.float32, torch.float64) else torch.float32
 
     dilated = torch.arange(kernel_size, device=x.device, dtype=torch.long) * dilation
     t0 = (torch.arange(out_length, device=x.device, dtype=torch.long) * stride).unsqueeze(-1)
 
-    relative = dilated.to(offsets.dtype) + offsets  # (B, G, Lo, K)
+    relative = dilated.to(work) + offsets.to(work)  # (B, G, Lo, K)
     if not unconstrained:
         relative = relative.clamp(0.0, float(dilation * (kernel_size - 1)))
-    positions = t0.to(offsets.dtype) + relative
+    positions = t0.to(work) + relative
 
-    # Exact-numerator form of 2*T/(L-1) - 1.
-    g_x = (2.0 * positions.to(dtype) - (length - 1)) / (length - 1)
+    # Exact-numerator form of 2*T/(L-1) - 1: the numerator is exact for integer
+    # T, unlike the algebraically equal 2*T/(L-1) - 1. grid_sample still undoes
+    # the transform internally as (g + 1) / 2 * (L - 1), and that `+ 1` is a
+    # cancellation no choice of grid construction can avoid -- which is why
+    # this backend cannot be bit-exact. See `_grid_sample_precision_study`.
+    g_x = (2.0 * positions - (length - 1)) / (length - 1)
     g_x = g_x.reshape(batch * groups, 1, out_length * kernel_size)
     # Height 1: with align_corners=True any y maps to pixel 0 * (1-1) = 0, but
     # 0.0 is the honest value.
     g_y = torch.zeros_like(g_x)
     grid = torch.stack((g_x, g_y), dim=-1)  # (B*G, 1, Lo*K, 2), last dim is (x, y)
 
-    xg = x.reshape(batch * groups, per_group, 1, length)
+    xg = x.to(work).reshape(batch * groups, per_group, 1, length)
     out = F.grid_sample(
         xg, grid, mode="bilinear", padding_mode="border", align_corners=True
     )  # (B*G, C/G, 1, Lo*K)
-    return out.reshape(batch, channels, out_length, kernel_size)
+    return out.reshape(batch, channels, out_length, kernel_size).to(out_dtype)
 
 
 def grid_sample_deform_conv1d(
@@ -255,6 +307,67 @@ def grid_sample_deform_conv1d(
         x, offsets, kernel_size, dilation, stride, unconstrained=unconstrained
     )
     return F.conv1d(sampled.flatten(-2, -1), weight, bias, stride=kernel_size, groups=groups)
+
+
+# ---------------------------------------------------------------------------
+# tinymera adapters
+# ---------------------------------------------------------------------------
+
+
+def dc1d_offsets_to_tinymera(offsets: Tensor, channels: int) -> Tensor:
+    """
+    ``(B, G, L_out, K)`` -> ``(B, C, L_out, K)``.
+
+    tinymera has no ``offset_groups``: every channel carries its own offset.
+    Reproducing a ``G``-group offset field therefore means repeating each
+    group's offsets across the ``C // G`` channels it owns.
+
+    ``repeat_interleave``, not ``repeat``. dc1d's channel axis is viewed as
+    ``(groups, channels_per_group)`` -- group-major -- so group ``g`` owns the
+    contiguous block ``[g*C/G, (g+1)*C/G)``. ``repeat`` would tile the groups
+    instead and silently associate every channel with the wrong offset. This is
+    one of the seven bugs dc1d fixed and it is exactly as easy to get wrong
+    here.
+
+    Differentiable, so gradients flow back to the ``(B, G, L_out, K)`` tensor
+    and can be compared against dc1d's directly.
+    """
+    groups = offsets.shape[1]
+    if groups == channels:
+        return offsets
+    if channels % groups != 0:
+        raise ValueError(f"offset_groups ({groups}) must divide channels ({channels})")
+    return offsets.repeat_interleave(channels // groups, dim=1)
+
+
+def tinymera_gs_deform_conv1d(
+    x: Tensor,
+    offsets_tm: Tensor,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    stride: int = 1,
+    dilation: int = 1,
+    groups: int = 1,
+) -> Tensor:
+    """tinymera's default (``grid_sample``) kernel. ``offsets_tm`` is ``(B, C, L_out, K)``."""
+    return tm_grid_sample(
+        x, offsets_tm, weight, bias, stride=stride, dilation=dilation, groups=groups, causal=False
+    )
+
+
+def tinymera_gather_deform_conv1d(
+    x: Tensor,
+    offsets_tm: Tensor,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    stride: int = 1,
+    dilation: int = 1,
+    groups: int = 1,
+) -> Tensor:
+    """tinymera's portable (``gather`` + lerp) kernel. ``offsets_tm`` is ``(B, C, L_out, K)``."""
+    return tm_gather(
+        x, offsets_tm, weight, bias, stride=stride, dilation=dilation, groups=groups, causal=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +492,28 @@ def check_equivalence(device: str) -> int:
             f"max |diff| = {(gs - want).abs().max().item():.3e}",
         )
 
+        # tinymera downcasts to float32 internally (see the note on `passes`
+        # below), so its anchor is run in float32 against a float32 reference,
+        # and scored on relative error rather than bit-exactness. dc1d and
+        # torchvision are exact here; tinymera's grid_sample kernel structurally
+        # cannot be, because of the [-1, 1] normalisation. The numbers are
+        # printed so the gap is visible rather than merely conceded.
+        x32, w32, b32 = x.float(), weight.float(), bias.float()
+        off32 = dc1d_offsets_to_tinymera(offsets.float(), channels)
+        want32 = F.conv1d(x32, w32, b32, stride=stride, dilation=dilation, groups=groups)
+        s32 = max(want32.abs().max().item(), 1.0)
+        for tag, fn in (
+            ("tinymera-gs", tinymera_gs_deform_conv1d),
+            ("tinymera-gth", tinymera_gather_deform_conv1d),
+        ):
+            tm = fn(x32, off32, w32, b32, stride, dilation, groups)
+            err = (tm - want32).abs().max().item()
+            report(
+                f"{tag:<12} zero-offset ~= conv1d  ({cfg}, fp32, rel<1e-3)",
+                err <= 1e-3 * s32,
+                f"max |diff| = {err:.3e} ({err / s32:.2e} relative; not bit-exact)",
+            )
+
         layer = DeformConv1d(
             channels,
             channels,
@@ -402,7 +537,6 @@ def check_equivalence(device: str) -> int:
     # ------------------------------------------------------------------
     # The real test: random fractional offsets, interior positions only.
     # ------------------------------------------------------------------
-    print("\n-- interior equivalence: random offsets, all taps in range --")
     radius = 2.0
     grid = [
         # (B, C, L, K, stride, dilation, groups, offset_groups)
@@ -417,74 +551,147 @@ def check_equivalence(device: str) -> int:
         (1, 4, 512, 7, 1, 3, 1, 1),
         (1, 4, 64, 1, 1, 1, 1, 1),
     ]
-    for batch, channels, length, kernel_size, stride, dilation, groups, off_groups in grid:
-        x = torch.randn(batch, channels, length, device=device, dtype=dtype, requires_grad=True)
-        weight = torch.randn(channels, channels // groups, kernel_size, device=device, dtype=dtype)
-        bias = torch.randn(channels, device=device, dtype=dtype)
-        out_len = output_length(length, kernel_size, dilation, stride)
-        offsets = (
-            (
-                torch.rand(batch, off_groups, out_len, kernel_size, device=device, dtype=dtype) * 2
-                - 1
-            )
-            * radius
-        ).requires_grad_(True)
 
-        layer = DeformConv1d(
-            channels,
-            channels,
-            kernel_size,
-            stride=stride,
-            dilation=dilation,
-            groups=groups,
-            padding="valid",
-            unconstrained=True,  # torchvision has no receptive-field constraint
-        ).to(device=device, dtype=dtype)
-        with torch.no_grad():
-            layer.weight.copy_(weight)
-            layer.bias.copy_(bias)
+    # Two passes at two working precisions, because the contenders do not all
+    # honour the dtype they are handed.
+    #
+    # torchvision and the grid_sample backend compute in the input dtype, so
+    # they can be held to a float64 tolerance -- which is a genuinely strict
+    # test, tight enough to catch a one-ULP indexing slip.
+    #
+    # tinymera cannot: `deform_conv1d_grid_sample` does `x.float()` and both of
+    # its kernels do `offsets.float()`, so a float64 input is silently
+    # downcast and the answer comes back with float32 error (~1e-5 here). That
+    # is a real property worth recording -- see the dtype-fidelity probe in
+    # `audit_defects` -- but holding it to 1e-10 would only re-measure the
+    # downcast over and over. It is therefore compared in float32, at a float32
+    # tolerance, where the question "is this the same operation?" is the one
+    # actually being asked.
+    #
+    # The float32 tolerance is 1e-3 *relative*, which looks slack next to the
+    # float64 pass's 1e-10. It is not doing the same job. At float32 the
+    # backends genuinely disagree at the 1e-5 level for three unavoidable
+    # reasons -- a different accumulation order over the K*C_in/groups terms of
+    # the output dot product (conv1d vs einsum vs a fused kernel),
+    # grid_sample's lossy [-1, 1] normalisation, and tinymera's internal
+    # downcast -- and none of those is an indexing error. What this pass is for
+    # is catching *structural* mistakes: a mis-mapped offset group, an
+    # off-by-one clamp, an inverted offset sign. Every one of those produces an
+    # O(1) relative error, two to three orders of magnitude above the floor, so
+    # 1e-3 separates them cleanly. dc1d's own float32-vs-float64 error is
+    # printed per config so the floor is visible rather than asserted.
+    passes = [
+        (torch.float64, ["torchvision", "grid_sample"], 1e-10, 1e-9),
+        (torch.float32, ["torchvision", "grid_sample", "tinymera-gs", "tinymera-gth"], 1e-3, 1e-3),
+    ]
 
-        dc = layer(x, offsets)
-        tv = tv_deform_conv1d(
-            x, dc1d_offsets_to_torchvision(offsets), weight, bias, stride, dilation
+    for work_dtype, names, fwd_tol, bwd_tol in passes:
+        print(
+            f"\n-- interior equivalence in {str(work_dtype).replace('torch.', '')}: "
+            f"random offsets, all taps in range --"
         )
-        gs = grid_sample_deform_conv1d(
-            x, offsets, weight, bias, stride, dilation, groups, unconstrained=True
-        )
-
-        sl = _interior_slice(out_len, length, kernel_size, dilation, stride, radius)
-        cfg = (
-            f"B={batch} C={channels} L={length} K={kernel_size} s={stride} "
-            f"d={dilation} g={groups} og={off_groups}"
-        )
-        scale = dc[:, :, sl].abs().max().item()
-
-        # Gradients, on the interior only. All three graphs are differentiated
-        # against the same upstream gradient, which is zeroed outside the
-        # interior so the boundary convention cannot contaminate the result.
-        gout = torch.zeros_like(dc)
-        gout[:, :, sl] = torch.randn_like(gout[:, :, sl])
-        grads = {
-            name: torch.autograd.grad(out, [x, offsets], gout)
-            for name, out in (("dc1d", dc), ("torchvision", tv), ("grid_sample", gs))
-        }
-
-        for name, out in (("torchvision", tv), ("grid_sample", gs)):
-            diff = (dc[:, :, sl] - out[:, :, sl]).abs().max().item()
-            report(
-                f"forward  dc1d vs {name:<11} {cfg}",
-                diff <= 1e-10 * max(scale, 1.0),
-                f"max |diff| = {diff:.3e} (values ~{scale:.1f})",
+        torch.manual_seed(0)
+        for batch, channels, length, kernel_size, stride, dilation, groups, off_groups in grid:
+            x = torch.randn(
+                batch, channels, length, device=device, dtype=work_dtype, requires_grad=True
             )
-            gx_diff = (grads["dc1d"][0] - grads[name][0]).abs().max().item()
-            go_diff = (grads["dc1d"][1] - grads[name][1]).abs().max().item()
-            gx_scale = max(grads["dc1d"][0].abs().max().item(), 1.0)
-            go_scale = max(grads["dc1d"][1].abs().max().item(), 1.0)
-            report(
-                f"backward dc1d vs {name:<11} {cfg}",
-                gx_diff <= 1e-9 * gx_scale and go_diff <= 1e-9 * go_scale,
-                f"max |d/dx diff| = {gx_diff:.3e}, max |d/doffset diff| = {go_diff:.3e}",
+            weight = torch.randn(
+                channels, channels // groups, kernel_size, device=device, dtype=work_dtype
             )
+            bias = torch.randn(channels, device=device, dtype=work_dtype)
+            out_len = output_length(length, kernel_size, dilation, stride)
+            offsets = (
+                (
+                    torch.rand(
+                        batch, off_groups, out_len, kernel_size, device=device, dtype=work_dtype
+                    )
+                    * 2
+                    - 1
+                )
+                * radius
+            ).requires_grad_(True)
+
+            layer = DeformConv1d(
+                channels,
+                channels,
+                kernel_size,
+                stride=stride,
+                dilation=dilation,
+                groups=groups,
+                padding="valid",
+                unconstrained=True,  # torchvision has no receptive-field constraint
+            ).to(device=device, dtype=work_dtype)
+            with torch.no_grad():
+                layer.weight.copy_(weight)
+                layer.bias.copy_(bias)
+
+            offsets_tm = dc1d_offsets_to_tinymera(offsets, channels)
+            outs = {"dc1d": layer(x, offsets)}
+            for name in names:
+                if name == "torchvision":
+                    outs[name] = tv_deform_conv1d(
+                        x, dc1d_offsets_to_torchvision(offsets), weight, bias, stride, dilation
+                    )
+                elif name == "grid_sample":
+                    outs[name] = grid_sample_deform_conv1d(
+                        x, offsets, weight, bias, stride, dilation, groups, unconstrained=True
+                    )
+                elif name == "tinymera-gs":
+                    outs[name] = tinymera_gs_deform_conv1d(
+                        x, offsets_tm, weight, bias, stride, dilation, groups
+                    )
+                elif name == "tinymera-gth":
+                    outs[name] = tinymera_gather_deform_conv1d(
+                        x, offsets_tm, weight, bias, stride, dilation, groups
+                    )
+                else:
+                    raise ValueError(f"unknown contender {name!r}")
+            dc = outs["dc1d"]
+
+            sl = _interior_slice(out_len, length, kernel_size, dilation, stride, radius)
+            cfg = (
+                f"B={batch} C={channels} L={length} K={kernel_size} s={stride} "
+                f"d={dilation} g={groups} og={off_groups}"
+            )
+            scale = dc[:, :, sl].abs().max().item()
+
+            # dc1d's own error at this working precision, so the floor the
+            # comparison sits on is measured rather than asserted.
+            if work_dtype is not torch.float64:
+                layer64 = layer.double()
+                dc64 = layer64(x.double(), offsets.double())
+                self_err = (dc[:, :, sl].double() - dc64[:, :, sl]).abs().max().item()
+                layer.to(work_dtype)
+                print(
+                    f"    (dc1d self-error {str(work_dtype).replace('torch.', '')} vs float64: "
+                    f"{self_err:.3e}, values ~{scale:.1f})"
+                )
+
+            # Gradients, on the interior only. Every graph is differentiated
+            # against the same upstream gradient, which is zeroed outside the
+            # interior so the boundary convention cannot contaminate the result.
+            gout = torch.zeros_like(dc)
+            gout[:, :, sl] = torch.randn_like(gout[:, :, sl])
+            grads = {
+                name: torch.autograd.grad(out, [x, offsets], gout) for name, out in outs.items()
+            }
+
+            for name in names:
+                diff = (dc[:, :, sl] - outs[name][:, :, sl]).abs().max().item()
+                report(
+                    f"forward  dc1d vs {name:<12} {cfg}",
+                    diff <= fwd_tol * max(scale, 1.0),
+                    f"max |diff| = {diff:.3e} (values ~{scale:.1f})",
+                )
+                gx_diff = (grads["dc1d"][0] - grads[name][0]).abs().max().item()
+                go_diff = (grads["dc1d"][1] - grads[name][1]).abs().max().item()
+                gx_scale = max(grads["dc1d"][0].abs().max().item(), 1.0)
+                go_scale = max(grads["dc1d"][1].abs().max().item(), 1.0)
+                report(
+                    f"backward dc1d vs {name:<12} {cfg}",
+                    gx_diff <= bwd_tol * gx_scale and go_diff <= bwd_tol * go_scale,
+                    f"max |d/dx diff| = {gx_diff:.3e}, max |d/doffset diff| = {go_diff:.3e}",
+                )
 
     # ------------------------------------------------------------------
     # Documented difference #1: boundary handling.
@@ -511,9 +718,11 @@ def check_equivalence(device: str) -> int:
         dc = layer(ramp, offsets)[0, 0]
         tv = tv_deform_conv1d(ramp, dc1d_offsets_to_torchvision(offsets), weight, None)[0, 0]
         gs = grid_sample_deform_conv1d(ramp, offsets, weight, None, unconstrained=True)[0, 0]
+        tmg = tinymera_gather_deform_conv1d(ramp, offsets, weight, None)[0, 0]
         print(f"  offset={off_val:+.1f} ({label}), x = [1..{length}], tap 0 only")
         print(f"    dc1d        (clamp)     out[:4] = {[round(v, 3) for v in dc[:4].tolist()]}")
         print(f"    grid_sample (border)    out[:4] = {[round(v, 3) for v in gs[:4].tolist()]}")
+        print(f"    tinymera    (clamp)     out[:4] = {[round(v, 3) for v in tmg[:4].tolist()]}")
         print(f"    torchvision (zero-pad)  out[:4] = {[round(v, 3) for v in tv[:4].tolist()]}")
         n_diff = int((dc - tv).abs().gt(1e-12).sum().item())
         print(
@@ -524,6 +733,11 @@ def check_equivalence(device: str) -> int:
             f"    grid_sample(border) reproduces dc1d(clamp) at offset {off_val:+.1f}",
             torch.allclose(gs, dc, atol=1e-12, rtol=0),
             f"max |diff| = {(gs - dc).abs().max().item():.3e}",
+        )
+        report(
+            f"    tinymera(clamp)     reproduces dc1d(clamp) at offset {off_val:+.1f}",
+            torch.allclose(tmg, dc, atol=1e-12, rtol=0),
+            f"max |diff| = {(tmg - dc).abs().max().item():.3e}",
         )
 
     # How wide is the affected region for realistic offsets?
@@ -691,13 +905,298 @@ def _grid_sample_gradcheck(device: str, report) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Defect cross-audit
+# ---------------------------------------------------------------------------
+
+
+def audit_defects(device: str) -> int:
+    """
+    Run dc1d's own bug list as executable probes against every backend.
+
+    dc1d fixed seven correctness bugs in commit ``eac995f``. tinymera is a
+    second implementation of the same algorithm by the same author, so the
+    interesting question is which of those bug classes recur. Each probe below
+    is written to *fail loudly* on the buggy behaviour, so a PASS is evidence of
+    absence rather than absence of evidence.
+
+    Not covered here (module-level, and only ``dc1d.ops`` is vendored from
+    tinymera): the stride/dilation-in-the-offset-network defect. See
+    ``benchmarks/BACKENDS.md`` for that one, which is reproduced directly
+    against the tinymera checkout.
+    """
+    print("\n=== Defect cross-audit ===\n")
+    failures = 0
+
+    def report(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures
+        if not ok:
+            failures += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  --  {detail}" if detail else ""))
+
+    # ------------------------------------------------------------------
+    # (1) dtype-inherited position arithmetic.
+    #
+    # The bug: deriving sampling positions with an arange/linspace that inherits
+    # the offset (or input) dtype. fp16 cannot represent integers past 2048, so
+    # positions past that silently collapse onto even indices -- wrong numbers,
+    # no NaN. Probe: zero offsets on a long fp16 sequence must reproduce a plain
+    # unfold exactly, because every sampling position is an exact integer.
+    # ------------------------------------------------------------------
+    print("-- (1) low-precision position arithmetic (zero offsets, L=16000) --")
+    print("   Two thresholds. `exact` means the sampled values are bit-identical to a")
+    print("   plain unfold, which is dc1d's headline invariant. `intact` means the")
+    print("   sampling landed on the right samples at all: an error comparable to the")
+    print("   signal's own RMS means the position arithmetic collapsed and the layer is")
+    print("   reading the wrong part of the sequence. Only `intact` is scored -- a")
+    print("   backend can be inexact and still perfectly usable.\n")
+    print(f"   | {'dtype':>9} | {'backend':<13} | {'max |err|':>11} | {'/ RMS(x)':>9} | exact |")
+    print("   |" + "|".join(["-" * 11, "-" * 15, "-" * 13, "-" * 11, "-" * 7]) + "|")
+
+    kernel_size, length = 3, 16000
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        if device == "cpu" and dtype is torch.float16:
+            continue
+        torch.manual_seed(0)
+        x = torch.randn(1, 4, length, device=device, dtype=dtype)
+        out_len = output_length(length, kernel_size)
+        offsets = torch.zeros(1, 4, out_len, kernel_size, device=device, dtype=dtype)
+        want = x.unfold(2, kernel_size, 1).to(torch.float64)  # exact answer
+        rms = x.to(torch.float64).pow(2).mean().sqrt().item()
+
+        # tinymera's kernels return a full conv, so drive them with an identity
+        # weight (tap 0 only) and compare against the corresponding unfold slice.
+        w = torch.zeros(4, 1, kernel_size, device=device, dtype=dtype)
+        w[:, 0, 0] = 1.0
+        probes = [
+            ("dc1d", efficient_linterpolate(x, offsets, kernel_size, 1, 1), want),
+            ("grid_sample", grid_sample_linterpolate(x, offsets, kernel_size, 1, 1), want),
+            ("tinymera-gs", tinymera_gs_deform_conv1d(x, offsets, w, None, 1, 1, 4), want[..., 0]),
+            (
+                "tinymera-gth",
+                tinymera_gather_deform_conv1d(x, offsets, w, None, 1, 1, 4),
+                want[..., 0],
+            ),
+        ]
+        for name, got, target in probes:
+            err = (got.to(torch.float64) - target).abs().max().item()
+            exact = err == 0.0
+            intact = err < 0.01 * rms
+            print(
+                f"   | {str(dtype).replace('torch.', ''):>9} | {name:<13} | {err:11.3e} "
+                f"| {err / rms:9.3e} | {'yes' if exact else 'no':<5} |"
+            )
+            if not intact:
+                failures += 1
+                print(
+                    f"   [FAIL] {name} at {dtype}: error is {err / rms:.1%} of RMS(x) -- "
+                    "the sampling positions have collapsed"
+                )
+
+    # ------------------------------------------------------------------
+    # (1b) The converse of (1): does the backend *honour* a high-precision
+    # input, or does it silently downcast?
+    #
+    # dc1d's fix for the fp16 position bug was to keep window starts in `long`
+    # and carry only the fraction in the input dtype -- so the op is exact at
+    # every dtype and float64 still buys float64. tinymera's fix was to force
+    # the position arithmetic to float32 (`offsets.float()`, and `x.float()` in
+    # the grid_sample kernel). That solves the fp16 direction and breaks the
+    # fp64 direction: a float64 model silently gets float32 sampling, and
+    # `torch.autograd.gradcheck` -- which requires float64 to be meaningful --
+    # cannot be used on it at all. tinymera has no gradcheck test.
+    # ------------------------------------------------------------------
+    print("\n-- (1b) float64 input is honoured, not silently downcast --")
+    torch.manual_seed(0)
+    length, kernel_size = 128, 3
+    out_len = output_length(length, kernel_size)
+    x = torch.randn(1, 2, length, device=device, dtype=torch.float64)
+    offsets = torch.rand(1, 2, out_len, kernel_size, device=device, dtype=torch.float64) - 0.5
+    w = torch.zeros(2, 1, kernel_size, device=device, dtype=torch.float64)
+    w[:, 0, 0] = 1.0
+
+    ref = efficient_linterpolate(x, offsets, kernel_size, 1, 1, unconstrained=True)[..., 0]
+    # Same maths in float32: the size of the gap a downcast would produce.
+    ref32 = efficient_linterpolate(
+        x.float(), offsets.float(), kernel_size, 1, 1, unconstrained=True
+    )[..., 0].to(torch.float64)
+    fp32_gap = (ref - ref32).abs().max().item()
+    print(f"  reference float64-vs-float32 gap for this input: {fp32_gap:.3e}")
+
+    got = grid_sample_linterpolate(x, offsets, kernel_size, 1, 1, unconstrained=True)[..., 0]
+    err = (got - ref).abs().max().item()
+    report(
+        "grid_sample  computes in float64 when given float64",
+        err < 0.01 * fp32_gap,
+        f"max |diff| vs dc1d fp64 = {err:.3e}",
+    )
+    for name, fn in (
+        ("tinymera-gs", tinymera_gs_deform_conv1d),
+        ("tinymera-gth", tinymera_gather_deform_conv1d),
+    ):
+        got = fn(x, offsets, w, None, 1, 1, 2)
+        err = (got - ref).abs().max().item()
+        report(
+            f"{name:<12} computes in float64 when given float64",
+            err < 0.01 * fp32_gap,
+            f"max |diff| vs dc1d fp64 = {err:.3e} (float32-sized: {err > 0.1 * fp32_gap})",
+        )
+
+    # ------------------------------------------------------------------
+    # (2) repeat vs repeat_interleave for offset groups.
+    #
+    # The bug: expanding a (B, G, ...) offset field to C channels with `repeat`
+    # (tiling: g0 g1 g0 g1 ...) instead of `repeat_interleave` (blocking:
+    # g0 g0 g1 g1 ...). dc1d's channel axis is group-major, so `repeat`
+    # associates every channel with the wrong offsets while keeping the shape
+    # valid -- silent, and invisible to any shape test.
+    #
+    # Probe: G=2, C=4. Give group 0 an offset of +1 and group 1 an offset of 0
+    # on a per-channel ramp. Channels 0,1 must move; channels 2,3 must not.
+    # ------------------------------------------------------------------
+    print("\n-- (2) offset-group -> channel mapping (group-major blocks, not tiles) --")
+    channels, groups, length, kernel_size = 4, 2, 32, 1
+    ramp = (
+        torch.arange(float(length), device=device, dtype=torch.float64)
+        .reshape(1, 1, length)
+        .repeat(1, channels, 1)
+    )
+    ramp = ramp + torch.arange(channels, device=device, dtype=torch.float64).reshape(1, -1, 1) * 100
+    out_len = output_length(length, kernel_size)
+    offsets = torch.zeros(1, groups, out_len, kernel_size, device=device, dtype=torch.float64)
+    offsets[:, 0] = 1.0  # group 0 samples one step to the right
+
+    # The final output position samples off the end and is clamped, so it is
+    # excluded: it says nothing about the group mapping.
+    cmp_len = out_len - 1
+
+    def _moved(sampled: Tensor) -> list[bool]:
+        return [
+            bool(torch.allclose(sampled[c, :cmp_len], ramp[0, c, :cmp_len] + 1.0))
+            for c in range(channels)
+        ]
+
+    got = efficient_linterpolate(ramp, offsets, kernel_size, 1, 1, unconstrained=True)[0, :, :, 0]
+    moved = _moved(got)
+    report(
+        "dc1d         maps group g to the contiguous channel block [g*C/G, (g+1)*C/G)",
+        moved == [True, True, False, False],
+        f"channels shifted by +1: {[c for c, m in enumerate(moved) if m]} (want [0, 1])",
+    )
+
+    got = grid_sample_linterpolate(ramp, offsets, kernel_size, 1, 1, unconstrained=True)[0, :, :, 0]
+    moved = _moved(got)
+    report(
+        "grid_sample  maps group g to the contiguous channel block [g*C/G, (g+1)*C/G)",
+        moved == [True, True, False, False],
+        f"channels shifted by +1: {[c for c, m in enumerate(moved) if m]} (want [0, 1])",
+    )
+
+    expanded = dc1d_offsets_to_tinymera(offsets, channels)
+    report(
+        "adapter      dc1d_offsets_to_tinymera uses repeat_interleave, not repeat",
+        bool(
+            torch.equal(
+                expanded[0, :, 0, 0],
+                torch.tensor([1.0, 1.0, 0.0, 0.0], device=device, dtype=torch.float64),
+            )
+        ),
+        f"per-channel offsets = {expanded[0, :, 0, 0].tolist()} (want [1, 1, 0, 0])",
+    )
+    print("  (tinymera has no offset_groups -- offsets are always per-channel, so this")
+    print("   bug class is structurally unreachable in its kernels.)")
+
+    # ------------------------------------------------------------------
+    # (3) boundary clamp to L vs L-1.
+    #
+    # The bug: clamping the sampling index to `length` (or the upper gather
+    # index to `length`) instead of `length - 1` / `length - 2`, which either
+    # reads out of bounds or wraps. Probe: a huge positive offset must read
+    # exactly x[L-1] for every clamping backend, and must not raise.
+    # ------------------------------------------------------------------
+    print("\n-- (3) boundary clamp lands on L-1, not L --")
+    length, kernel_size = 64, 3
+    ramp = torch.arange(1.0, length + 1, device=device, dtype=torch.float64).reshape(1, 1, length)
+    out_len = output_length(length, kernel_size)
+    big = torch.full((1, 1, out_len, kernel_size), 1e6, device=device, dtype=torch.float64)
+    last = float(length)  # x[L-1] == L given the 1..L ramp
+
+    got = efficient_linterpolate(ramp, big, kernel_size, 1, 1, unconstrained=True)
+    report(
+        "dc1d         saturates to x[L-1]",
+        bool(torch.all(got == last)),
+        f"unique values = {got.unique().tolist()[:4]} (want [{last}])",
+    )
+    got = grid_sample_linterpolate(ramp, big, kernel_size, 1, 1, unconstrained=True)
+    report(
+        "grid_sample  saturates to x[L-1]",
+        bool(torch.all(got == last)),
+        f"unique values = {got.unique().tolist()[:4]} (want [{last}])",
+    )
+
+    w = torch.zeros(1, 1, kernel_size, device=device, dtype=torch.float64)
+    w[0, 0, 0] = 1.0
+    for name, fn in (
+        ("tinymera-gs", tinymera_gs_deform_conv1d),
+        ("tinymera-gth", tinymera_gather_deform_conv1d),
+    ):
+        got = fn(ramp, big, w, None, 1, 1, 1)
+        report(
+            f"{name:<12} saturates to x[L-1]",
+            bool(torch.all(got == last)),
+            f"unique values = {got.unique().tolist()[:4]} (want [{last}])",
+        )
+
+    # A negative saturation probe too: torchvision must NOT clamp (zero-pad).
+    got = tv_deform_conv1d(ramp, dc1d_offsets_to_torchvision(big), w, None)
+    report(
+        "torchvision  zero-pads instead of clamping (expected difference)",
+        bool(torch.all(got == 0.0)),
+        f"unique values = {got.unique().tolist()[:4]} (want [0.0])",
+    )
+
+    # ------------------------------------------------------------------
+    # (4) stride/dilation dropped in the offset-prediction path.
+    #
+    # dc1d's PackedDeformConv1d used to build its offset conv with a hardcoded
+    # stride=1 / dilation=1, so it emitted the wrong number of offset positions
+    # for any strided or dilated layer. Probe the fixed side of the table.
+    # ------------------------------------------------------------------
+    print("\n-- (4) packed offset network honours stride and dilation --")
+    from dc1d.nn import PackedDeformConv1d
+
+    for stride, dilation in ((1, 1), (2, 1), (1, 4), (3, 2)):
+        layer = PackedDeformConv1d(
+            8, 8, 3, stride=stride, dilation=dilation, groups=8, padding="valid"
+        ).to(device)
+        xin = torch.randn(2, 8, 128, device=device)
+        try:
+            y = layer(xin)
+            want = output_length(128, 3, dilation, stride)
+            ok, detail = y.shape[-1] == want, f"got L_out={y.shape[-1]}, want {want}"
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        report(f"dc1d PackedDeformConv1d s={stride} d={dilation}", ok, detail)
+
+    # ------------------------------------------------------------------
+    # (5) `^` is XOR, not exponentiation.
+    # ------------------------------------------------------------------
+    print("\n-- (5) 2^7-style XOR-for-exponent --")
+    print("  static check, both repos (see BACKENDS.md): dc1d had one in nn.py's __main__")
+    print("  demo (fixed, now 2**7); tinymera has none -- `grep -rE '[0-9]\\s*\\^\\s*[0-9]'`")
+    print("  over the fix/causality tree returns only a comment.")
+
+    print(f"\n{'=' * 70}\n{failures} defect-audit failure(s)\n")
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
 # Order matters: dc1d is the reference every ratio is taken against, and
 # nn.Conv1d is the non-deformable floor.
-IMPLS = ["dc1d", "torchvision", "grid_sample", "nn.Conv1d"]
-CONTENDERS = ["torchvision", "grid_sample"]
+IMPLS = ["dc1d", "torchvision", "grid_sample", "tinymera-gs", "tinymera-gth", "nn.Conv1d"]
+CONTENDERS = ["torchvision", "grid_sample", "tinymera-gs", "tinymera-gth"]
 
 
 @dataclass
@@ -735,6 +1234,9 @@ GRID: list[Config] = [
     Config("speech-1x256", 1, 256, 16000, 3, 1, 256),
     Config("speech-4x256", 4, 256, 16000, 3, 8, 256),
     Config("speech-dense", 1, 256, 16000, 3, 1, 1),
+    # Conv-TasNet TCN block dimensions (H=512, K=3, T=8000, B=8): the config the
+    # "~393 MB per layer per forward" static estimate for tinymera refers to.
+    Config("convtasnet-H512", 8, 512, 8000, 3, 1, 512, offset_groups=512),
 ]
 
 LENGTH_SWEEP: list[Config] = [
@@ -777,11 +1279,15 @@ def make_inputs(cfg: Config, device: str, dtype: torch.dtype, requires_grad: boo
         padding="valid",
     ).to(device=device, dtype=dtype)
 
-    # torchvision-layout offsets are built OUTSIDE the timed region: a caller
-    # who has committed to torchvision would produce them in this layout to
-    # begin with, so charging the permute to torchvision would be unfair.
+    # torchvision- and tinymera-layout offsets are built OUTSIDE the timed
+    # region: a caller who has committed to either would produce them in that
+    # layout to begin with, so charging the permute (or the group broadcast) to
+    # them would be unfair.
     offsets_tv = dc1d_offsets_to_torchvision(offsets)
-    return x, offsets, offsets_tv, layer, vanilla, out_len
+    offsets_tm = dc1d_offsets_to_tinymera(offsets, cfg.channels)
+    if offsets_tm is not offsets:
+        offsets_tm = offsets_tm.detach().contiguous().requires_grad_(requires_grad)
+    return x, offsets, offsets_tv, offsets_tm, layer, vanilla, out_len
 
 
 def _timer(stmt: str, globals_: dict, sub_label: str, description: str, min_run_time: float):
@@ -817,17 +1323,22 @@ def bench_config(
     row: dict = {"name": cfg.name, "label": cfg.label}
 
     for phase, requires_grad in (("fwd", False), ("fwd+bwd", True)):
-        x, offsets, offsets_tv, layer, vanilla, _ = make_inputs(cfg, device, dtype, requires_grad)
+        x, offsets, offsets_tv, offsets_tm, layer, vanilla, _ = make_inputs(
+            cfg, device, dtype, requires_grad
+        )
         g = {
             "x": x,
             "offsets": offsets,
             "offsets_tv": offsets_tv,
+            "offsets_tm": offsets_tm,
             "layer": layer,
             "vanilla": vanilla,
             "weight": layer.weight,
             "bias": layer.bias,
             "tv_deform_conv1d": tv_deform_conv1d,
             "grid_sample_deform_conv1d": grid_sample_deform_conv1d,
+            "tinymera_gs_deform_conv1d": tinymera_gs_deform_conv1d,
+            "tinymera_gather_deform_conv1d": tinymera_gather_deform_conv1d,
             "stride": cfg.stride,
             "dilation": cfg.dilation,
             "groups": cfg.groups,
@@ -837,6 +1348,13 @@ def bench_config(
             "torchvision": "tv_deform_conv1d(x, offsets_tv, weight, bias, stride, dilation)",
             "grid_sample": (
                 "grid_sample_deform_conv1d(x, offsets, weight, bias, stride, dilation, groups)"
+            ),
+            "tinymera-gs": (
+                "tinymera_gs_deform_conv1d(x, offsets_tm, weight, bias, stride, dilation, groups)"
+            ),
+            "tinymera-gth": (
+                "tinymera_gather_deform_conv1d("
+                "x, offsets_tm, weight, bias, stride, dilation, groups)"
             ),
             "nn.Conv1d": "vanilla(x)",
         }
@@ -864,7 +1382,7 @@ def bench_config(
             spread = max(spread, max(values) / min(values))
         row[f"spread {phase}"] = spread
 
-        del x, offsets, offsets_tv, layer, vanilla, g
+        del x, offsets, offsets_tv, offsets_tm, layer, vanilla, g
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -876,24 +1394,50 @@ def bench_config(
 # ---------------------------------------------------------------------------
 
 
-def _run_once(impl: str, phase: str, cfg: Config, device: str, dtype: torch.dtype) -> None:
+def _build_call(impl: str, phase: str, cfg: Config, device: str, dtype: torch.dtype):
+    """
+    Return ``(run, keepalive)``: a zero-argument closure that executes exactly
+    one forward (or forward+backward) of ``impl``, plus the tensors it closes
+    over.
+
+    Setup is deliberately separated from execution so that the memory
+    high-water mark can be reset *after* the inputs exist. Measuring peak minus
+    a baseline taken before construction charges every backend for the same
+    inputs -- including the two alternative offset layouts it does not use --
+    which inflates all four figures by a constant and compresses the ratios
+    towards 1.
+    """
     requires_grad = phase == "fwd+bwd"
-    x, offsets, offsets_tv, layer, vanilla, _ = make_inputs(cfg, device, dtype, requires_grad)
-    if impl == "dc1d":
-        y = layer(x, offsets)
-    elif impl == "torchvision":
-        y = tv_deform_conv1d(x, offsets_tv, layer.weight, layer.bias, cfg.stride, cfg.dilation)
-    elif impl == "grid_sample":
-        y = grid_sample_deform_conv1d(
+    x, offsets, offsets_tv, offsets_tm, layer, vanilla, _ = make_inputs(
+        cfg, device, dtype, requires_grad
+    )
+    fns = {
+        "dc1d": lambda: layer(x, offsets),
+        "torchvision": lambda: tv_deform_conv1d(
+            x, offsets_tv, layer.weight, layer.bias, cfg.stride, cfg.dilation
+        ),
+        "grid_sample": lambda: grid_sample_deform_conv1d(
             x, offsets, layer.weight, layer.bias, cfg.stride, cfg.dilation, cfg.groups
-        )
-    else:
-        y = vanilla(x)
-    if requires_grad:
-        y.sum().backward()
-    if device.startswith("cuda"):
-        torch.cuda.synchronize(device)
-    del y, x, offsets, offsets_tv, layer, vanilla
+        ),
+        "tinymera-gs": lambda: tinymera_gs_deform_conv1d(
+            x, offsets_tm, layer.weight, layer.bias, cfg.stride, cfg.dilation, cfg.groups
+        ),
+        "tinymera-gth": lambda: tinymera_gather_deform_conv1d(
+            x, offsets_tm, layer.weight, layer.bias, cfg.stride, cfg.dilation, cfg.groups
+        ),
+        "nn.Conv1d": lambda: vanilla(x),
+    }
+    fn = fns[impl]
+
+    def run() -> None:
+        y = fn()
+        if requires_grad:
+            y.sum().backward()
+        if device.startswith("cuda"):
+            torch.cuda.synchronize(device)
+        del y
+
+    return run, (x, offsets, offsets_tv, offsets_tm, layer, vanilla)
 
 
 def measure_cuda_memory(cfg: Config, device: str, dtype: torch.dtype) -> dict:
@@ -901,11 +1445,15 @@ def measure_cuda_memory(cfg: Config, device: str, dtype: torch.dtype) -> dict:
     for phase in ("fwd", "fwd+bwd"):
         for impl in IMPLS:
             torch.cuda.empty_cache()
+            run, keepalive = _build_call(impl, phase, cfg, device, dtype)
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
             base = torch.cuda.memory_allocated(device)
-            _run_once(impl, phase, cfg, device, dtype)
+            run()
             peak = torch.cuda.max_memory_allocated(device)
             row[f"{impl} {phase}"] = (peak - base) / 2**20
+            del run, keepalive
             torch.cuda.empty_cache()
     return row
 
@@ -948,8 +1496,9 @@ def _mem_worker(payload: str) -> None:
     spec = json.loads(payload)
     cfg = Config(**spec["cfg"])
     dtype = getattr(torch, spec["dtype"])
+    run, _keepalive = _build_call(spec["impl"], spec["phase"], cfg, "cpu", dtype)
     before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    _run_once(spec["impl"], spec["phase"], cfg, "cpu", dtype)
+    run()
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(max(peak - before, 0) / 1024.0)
 
@@ -974,8 +1523,8 @@ def print_timing_table(rows: list[dict], title: str) -> None:
     """
     for phase, tag in (("fwd", "forward"), ("fwd+bwd", "forward+backward")):
         print(f"\n### {title} -- {tag}\n")
-        header = ["config", "dc1d", "torchvision", "grid_sample", "nn.Conv1d", "spread"]
-        widths = [34, 9, 18, 18, 9, 7]
+        header = ["config", "dc1d", *CONTENDERS, "nn.Conv1d", "spread"]
+        widths = [34, 9, *([17] * len(CONTENDERS)), 9, 7]
         body = []
         for r in rows:
             ref = r[f"dc1d {phase}"] * 1e3
@@ -998,15 +1547,15 @@ def print_timing_table(rows: list[dict], title: str) -> None:
 def print_memory_table(rows: list[dict], title: str, unit: str) -> None:
     for phase, tag in (("fwd", "forward"), ("fwd+bwd", "forward+backward")):
         print(f"\n### {title} -- {tag}\n")
-        header = ["config", "dc1d", "torchvision", "grid_sample", "nn.Conv1d"]
-        widths = [34, 9, 18, 18, 9]
+        header = ["config", "dc1d", *CONTENDERS, "nn.Conv1d"]
+        widths = [34, 9, *([17] * len(CONTENDERS)), 9]
         body = []
         for r in rows:
             ref = r[f"dc1d {phase}"]
             cells = [r["label"], f"{ref:.1f}"]
             for impl in CONTENDERS:
                 v = r[f"{impl} {phase}"]
-                cells.append(f"{v:.1f} ({ref / v:.2f}x)")
+                cells.append(f"{v:.1f} ({ref / v:.2f}x)" if v else f"{v:.1f} (n/a)")
             cells.append(f"{r[f'nn.Conv1d {phase}']:.1f}")
             body.append(cells)
         _emit_table(header, widths, body)
@@ -1020,6 +1569,7 @@ def environment_report(device: str) -> None:
     print("=" * 78)
     print(f"torch          : {torch.__version__}")
     print(f"torchvision    : {TORCHVISION_VERSION}")
+    print(f"tinymera ref   : {TINYMERA_REF}")
     print(f"python         : {sys.version.split()[0]}")
     print(f"device         : {device}")
     if device.startswith("cuda"):
@@ -1041,9 +1591,10 @@ def main() -> int:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     parser.add_argument("--check", action="store_true", help="run equivalence checks only")
+    parser.add_argument("--defects", action="store_true", help="run the defect cross-audit only")
     parser.add_argument("--bench", action="store_true", help="run timing sweep only")
     parser.add_argument("--mem", action="store_true", help="run memory sweep only")
-    parser.add_argument("--all", action="store_true", help="check + bench + mem")
+    parser.add_argument("--all", action="store_true", help="check + defects + bench + mem")
     parser.add_argument("--min-run-time", type=float, default=0.3)
     parser.add_argument(
         "--rounds",
@@ -1067,10 +1618,10 @@ def main() -> int:
         print(__doc__.split("Degenerating")[0].split("torchvision is *not*")[1])
         return 2
 
-    if not (args.check or args.bench or args.mem):
+    if not (args.check or args.defects or args.bench or args.mem):
         args.all = True
     if args.all:
-        args.check = args.bench = args.mem = True
+        args.check = args.defects = args.bench = args.mem = True
 
     if args.device.startswith("cuda"):
         # torch.utils.benchmark synchronises the *current* device, so pin it or
@@ -1082,7 +1633,9 @@ def main() -> int:
 
     failures = 0
     if args.check:
-        failures = check_equivalence(args.device)
+        failures += check_equivalence(args.device)
+    if args.defects:
+        failures += audit_defects(args.device)
 
     if args.bench:
 
