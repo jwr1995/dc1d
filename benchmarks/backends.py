@@ -1565,11 +1565,44 @@ def print_memory_table(rows: list[dict], title: str, unit: str) -> None:
     )
 
 
+def maybe_disable_triton_overrides() -> str:
+    """
+    torch 2.13 ships Triton-DSL overrides for a handful of ATen ops (notably
+    ``einsum`` -> ``_bmm_outer_product``) that are JIT-compiled on first use.
+    That JIT needs a host C compiler. On a machine without one, the *first*
+    ``einsum`` on CUDA raises ``RuntimeError: Failed to find C compiler``, which
+    would take tinymera's kernels out of the comparison entirely.
+
+    When no compiler is visible the Triton overrides are deregistered and the
+    ops fall back to their ATen implementations. This is disclosed rather than
+    hidden because it changes what is being measured: with a compiler present,
+    tinymera's ``einsum`` contraction would run a Triton kernel instead of
+    ATen ``bmm``. The switch is global, so every backend is measured under the
+    same dispatch regime and the comparison stays internally fair -- but the
+    absolute tinymera figures are "ATen fallback", not "best possible".
+
+    Returns a human-readable status string for the environment report.
+    """
+    import shutil
+
+    compiler = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
+    if compiler:
+        return f"enabled (C compiler: {compiler})"
+    try:
+        from torch._native import registry as _native_registry
+
+        _native_registry.deregister_op_overrides(disable_dsl_names=["triton"])
+    except Exception as exc:  # noqa: BLE001 - best effort, older torch has no _native
+        return f"not applicable ({type(exc).__name__})"
+    return "DISABLED -- no host C compiler, Triton JIT unavailable; ATen fallbacks in use"
+
+
 def environment_report(device: str) -> None:
     print("=" * 78)
     print(f"torch          : {torch.__version__}")
     print(f"torchvision    : {TORCHVISION_VERSION}")
     print(f"tinymera ref   : {TINYMERA_REF}")
+    print(f"triton overrides: {maybe_disable_triton_overrides()}")
     print(f"python         : {sys.version.split()[0]}")
     print(f"device         : {device}")
     if device.startswith("cuda"):
