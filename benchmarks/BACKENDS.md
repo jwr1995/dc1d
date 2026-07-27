@@ -128,12 +128,13 @@ covering stride, dilation, groups, offset groups, `K=1`, `K=7`, and `L=512`.
 Gradients are taken against a common upstream gradient that is zeroed outside
 the interior.
 
-**float64, tolerance `1e-10` relative — all pass, 0 failures:**
+**float64, tolerance `1e-10` relative — all pass, 0 failures** (max over the 10
+configurations, on the RTX 3090; values are `O(10)`):
 
 | pair | forward | `d/d input` | `d/d offsets` |
 |---|---|---|---|
-| dc1d vs torchvision | `≤ 4.7e-13` | `≤ 5.1e-13` | `≤ 7.1e-15` |
-| dc1d vs grid_sample | `≤ 1.2e-12` | `≤ 7.7e-13` | `≤ 7.1e-15` |
+| dc1d vs torchvision | `5.38e-13` | `5.76e-13` | `7.11e-15` |
+| dc1d vs grid_sample | `1.15e-12` | `1.01e-12` | `1.42e-14` |
 
 **The offset gradient — the entire point of a deformable layer — agrees to
 float64 round-off in all three implementations.** `grid_sample` propagates
@@ -142,7 +143,16 @@ both `input` and `offsets` passes for the `grid_sample` backend
 (`_grid_sample_gradcheck`).
 
 **float32, tolerance `1e-3` relative — all pass, 0 failures**, including both
-tinymera kernels. The slacker tolerance is not a weaker claim about indexing:
+tinymera kernels. Max forward error over the same 10 configurations:
+
+| backend | max abs error | dc1d's own float32-vs-float64 error |
+|---|---|---|
+| torchvision | `2.74e-04` | `4.0e-07` – `7.1e-06` |
+| grid_sample | `4.45e-04` | (same reference) |
+| tinymera-gs | `5.51e-04` | |
+| tinymera-gth | `2.74e-04` | |
+
+The slacker tolerance is not a weaker claim about indexing:
 at float32 the backends genuinely disagree at ~`1e-5` for three unavoidable
 reasons (different accumulation order over the `K*C_in/groups` terms,
 `grid_sample`'s normalisation, tinymera's internal downcast), while any
@@ -165,7 +175,7 @@ Input `x = [1..12]`, `K=3`, tap 0 isolated, first four output positions:
 | `+50.0` | `12.0, ...` | `12.0, ...` | `12.0, ...` | `0.0, ...` |
 
 * **dc1d, grid_sample and tinymera all clamp** and agree with each other to
-  `≤ 2.2e-16` (grid_sample) and **exactly `0`** (tinymera) at every offset
+  `≤ 4.4e-16` (grid_sample) and **exactly `0`** (tinymera) at every offset
   tested. dc1d's clamp keeps the interpolation weights summing to 1 everywhere.
 * **torchvision zero-pads.** An out-of-bounds bilinear tap contributes `0`, so
   a tap at `-0.5` reads `0.5 * x[0]` rather than `x[0]`, and differs at up to
@@ -198,22 +208,29 @@ in `g` becomes an error of `eps * (L - 1) / 2` **samples** in the recovered
 position. No choice of grid construction avoids it — the backend here already
 uses the exact-numerator form `(2T - (L-1)) / (L-1)`.
 
-**Measured** (zero offsets, so the exact answer is a plain `unfold`; error
-should be `0`):
+**Measured on the 3090** (zero offsets, so the exact answer is a plain
+`unfold`; error should be `0`):
 
 | dtype | L | dc1d max err | grid_sample max err | implied position err |
 |---|---|---|---|---|
-| float32 | 256 | `0` | `3.2e-05` | `3.5e-05` samples |
-| float32 | 2048 | `0` | `4.95e-04` | `5.0e-04` samples |
-| float32 | 16000 | `0` | `4.13e-03` | `4.3e-03` samples |
-| float32 | 65536 | `0` | `1.96e-02` | `2.1e-02` samples |
-| float16 | 256 | `0` | `3.6e-01` | `0.40` samples |
-| float16 | 2048 | `0` | `2.62e+00` | `2.7` samples |
+| float32 | 256 | `0` | `6.34e-05` | `6.7e-05` samples |
+| float32 | 2048 | `0` | `4.80e-04` | `5.2e-04` samples |
+| float32 | 16000 | `0` | `4.59e-03` | `4.9e-03` samples |
+| float32 | 65536 | `0` | `2.22e-02` | `2.3e-02` samples |
+| float16 | 256 | `0` | `6.10e-05` | `6.5e-05` samples |
+| float16 | 2048 | `0` | `4.88e-04` | `5.3e-04` samples |
+| float16 | 16000 | `0` | `4.15e-03` | `4.4e-03` samples |
+| float16 | 65536 | `0` | `2.15e-02` | `2.3e-02` samples |
 
 dc1d is bit-exact at every length and every dtype. `grid_sample`'s error grows
-**linearly with L**. In float32 it stays below `2e-2` samples even at `L=65536`
-— tolerable for a layer whose offsets are learned anyway — but it is not zero,
-and the `nn.Conv1d` invariant is lost.
+**linearly with L** and is essentially *dtype-independent* — it is the
+normalisation, not the storage precision. In float32 it stays below `2.3e-2`
+samples even at `L=65536`, which is tolerable for a layer whose offsets are
+learned anyway, but it is not zero and the `nn.Conv1d` invariant is lost.
+
+**The fp16 rows track the fp32 rows only because this backend forces the
+position arithmetic to fp32.** Without that they are ~1000× worse — see §3, D1:
+a naive version reads the wrong samples entirely at fp16/bf16 (~6x RMS(x)).
 
 ---
 
@@ -238,6 +255,33 @@ against `feature/exciting-plc`), which is "post-fix". "Pre-fix" is
 | **D5** | stride/dilation dropped in the offset-prediction path | **present** — offset conv hardcoded `stride=1, dilation=1`; `stride=2, L=40` returned 38 instead of 19 | fixed — both forwarded (`dc1d/nn.py:337-348`) | **present** | **STILL PRESENT (partial)** — `dilation` is forwarded, **`stride` is hardcoded to 1** (`nn/deform_conv1d.py:175-183`) |
 | **D6** | the index clamp hides shape bugs (no contract validation) | **present** — wrong `L_out` produced plausible wrong-length output | fixed — `ValueError` against the closed form (`dc1d/nn.py:236-243`), plus `expected_offset_positions()` | **present** | **STILL PRESENT** — sampling kernels take `T_out` from `offsets.shape` and clamp; nothing validates it |
 | **D7** | `2^7`-style XOR-for-exponent | **present** — a benchmark ran `dilation=5` for three years | fixed — `2**7` (`dc1d/nn.py:487`) | absent | absent — `grep -rE '[0-9]\s*\^\s*[0-9]'` over the tree returns only a comment |
+
+### D1 — the candidate `grid_sample` backend is exposed to this too
+
+Worth stating plainly, because it bears on §5.1. `efficient_linterpolate` is
+immune to D1 by construction: it keeps the window start in `long` and only the
+sub-sample fraction ever touches the input dtype. **A `grid_sample` backend
+cannot do that** — `grid_sample`'s only input is one normalised float
+coordinate, so the integer part and the fraction must share a mantissa.
+
+Measured on the 3090, zero offsets, `L=16000`, error as a fraction of `RMS(x)`:
+
+| backend | float32 | float16 | bfloat16 | bit-exact? |
+|---|---|---|---|---|
+| dc1d | `0` | `0` | `0` | **yes, every dtype** |
+| grid_sample (**naive**, inherits dtype) | `5.73e-03` | **`6.05`** | **`5.53`** | no |
+| grid_sample (fp32 forced) | `5.73e-03` | `5.86e-03` | `7.82e-03` | no |
+| tinymera-gs (fp32 forced) | `5.73e-03` | `5.86e-03` | `7.82e-03` | no |
+| tinymera-gth | `0` | `0` | `0` | **yes** |
+
+An error of `6× RMS(x)` means the sampling positions have collapsed and the
+layer is reading unrelated parts of the sequence — silently, with no NaN. That
+is dc1d's C3 verbatim. Forcing the arithmetic to fp32 (which tinymera's kernel
+also does) brings it back to the normalisation floor, at which point the dtype
+barely matters. **Any adopted `grid_sample` backend must do this from the first
+commit.** Reproduce with
+`benchmarks/backends.py --defects` (the forced rows) — the naive rows come from
+deleting the `work = ...` upcast in `grid_sample_linterpolate`.
 
 ### D5 — reproduced
 
@@ -447,8 +491,8 @@ The measurements support it decisively, and the deciding constraint holds:
   was the deciding constraint and it is satisfied. **dc1d's "no C++/CUDA
   compilation" property is preserved.**
 * **The offset gradient is correct.** `gradcheck` in float64 against both
-  `input` and `offsets` passes, and the gradients match dc1d's to `≤ 7.1e-15`
-  (`d/d offsets`) and `≤ 7.7e-13` (`d/d input`). This is the thing that had to
+  `input` and `offsets` passes, and the gradients match dc1d's to `≤ 1.4e-14`
+  (`d/d offsets`) and `≤ 1.0e-12` (`d/d input`). This is the thing that had to
   be true; it is.
 * **Boundary semantics are identical.** `padding_mode='border'` reproduces
   dc1d's index clamp exactly (error `0` at every probed offset), so adopting it
@@ -460,16 +504,16 @@ The measurements support it decisively, and the deciding constraint holds:
 
 1. **The `nn.Conv1d` bit-exactness invariant.** `grid_sample`'s `[-1, 1]`
    normalisation is lossy and the error grows linearly with `L`
-   (`4.1e-3` at `L=16000`, `2.0e-2` at `L=65536`, in *samples* of position
+   (`4.6e-3` at `L=16000`, `2.3e-2` at `L=65536`, in *samples* of position
    error). `tests/test_equivalence.py` — which CLAUDE.md correctly calls the
    single load-bearing test — **cannot** be applied to this backend bit-exactly.
    That test is what made the 3× kernel rewrite safe to attempt; giving it up by
    default would be a bad trade for a 2× speedup.
 2. **Low-precision safety, unless explicitly defended.** A naive `grid_sample`
    backend that inherits the input dtype **reintroduces dc1d's C3 bug**: measured
-   at bf16 and `L=16000`, it read the wrong samples entirely, with an error
-   **5.94× the RMS of the signal**. Forcing the position and sampling arithmetic
-   to at least float32 fixes it (error drops to `7.8e-3`, the normalisation
+   at `L=16000`, it read the wrong samples entirely — error **6.05× RMS(x)** at
+   fp16 and **5.53×** at bf16. Forcing the position and sampling arithmetic to at
+   least float32 fixes it (error drops to `5.9e-3` / `7.8e-3`, the normalisation
    floor). This is not optional and must be in the implementation from day one —
    it is the same class of bug the package has already paid for once.
 

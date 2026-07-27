@@ -266,13 +266,19 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
 - [x] `torch.max(dilated_positions)` (old `ops.py:206`), a device reduction, replaced
       with the Python constant `dilation * (kernel_size - 1)` (`dc1d/ops.py:128`).
 - [x] `L >= 2` guarded (`dc1d/ops.py:110`).
-- [ ] **GPU speedup and kernel-launch counts are NOT measured.** Only CPU-only torch
-      is installed. The review's "~25 kernels → ~5" and "4–8× / ~10× memory" figures
-      are **estimates that this pass did not confirm**; the numbers reported above
-      are CPU wall-clock and CPU RSS, and the op-count reduction is a static reading
-      of the code, not a profile. **Left:** run `benchmarks/benchmark.py --device cuda`
-      on the 3090 and, for launch counts, `torch.profiler` with
-      `activities=[CUDA]` or `nsys`.
+- [x] **CPU RSS reduction re-verified** on `bench/vs-torchvision`: pre-rewrite
+      `291.0 MiB` → current `99.8 MiB` = **2.92×** at `B=4 C=256 L=2048 K=3 d=8`
+      (TODO recorded 283 → 91 = 3.1×; agreement within RSS run-to-run variation).
+      *Note:* the rewrite is in `eac995f`, **not** `50a9bed` — the latter's message
+      claims the rewrite but it only touches `benchmarks/benchmark.py`.
+- [ ] **GPU speedup for the dc1d-old-vs-dc1d-new comparison is still NOT measured,
+      and neither are kernel-launch counts.** The review's "~25 kernels → ~5" and
+      "4–8× / ~10× memory" figures remain **estimates**. **Partly superseded:**
+      `benchmarks/BACKENDS.md` now has full CUDA latency and
+      `max_memory_allocated` numbers for dc1d against three *other* backends on
+      the 3090 — but that compares backends, not old-dc1d against new-dc1d.
+      **Left:** `benchmarks/benchmark.py --device cuda`, and `torch.profiler`
+      with `activities=[CUDA]` (or `nsys`) for launch counts.
 - [ ] **Deferred perf work, not attempted:**
       - [ ] Fuse the two `take_along_dim` gathers. `x1` is always `x0` shifted by one
             sample, so a single gather of a `(Lo, K, 2)` window — or a `Tensor.unfold`
@@ -290,6 +296,33 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       - [ ] Benchmark `torch.compile(mode="max-autotune")` end-to-end. Dynamo already
             traces the layer with zero graph breaks, so this is now reachable; it was
             not before (`self.device` mutation in `forward`).
+- [ ] **Adopt a `grid_sample` interpolation backend (opt-in).** Measured and
+      recommended in `benchmarks/BACKENDS.md` §5.1. It beats the current kernel in
+      **13/13** measured configurations on an RTX 3090: **1.6–5.3× faster forward,
+      1.4–2.6× faster fwd+bwd, 1.6–3.9× less forward memory, 2.3–5.2× less fwd+bwd
+      memory** — larger than the 1.5–2× the review estimated. `aten::grid_sampler_2d`
+      is an ATen builtin, so **the no-compilation property is preserved** (verified).
+      `gradcheck` passes in float64 against both `input` and `offsets`, and
+      `padding_mode='border'` reproduces dc1d's index clamp exactly.
+      **Must be opt-in, not the default**, for two reasons: (a) the `[-1, 1]`
+      normalisation is lossy, so `tests/test_equivalence.py`'s bit-exact
+      `nn.Conv1d` invariant is lost — position error grows linearly with `L`
+      (`4.6e-3` samples at `L=16000`, `2.3e-2` at `L=65536`); (b) a version that
+      inherits the input dtype **reintroduces C3** — measured at `L=16000` it read
+      the wrong samples entirely, error `6.05×` RMS(x) at fp16 and `5.53×` at bf16.
+      The implementation must force position and sampling arithmetic to ≥ float32
+      from day one.
+      **Left:** move `grid_sample_linterpolate` from `benchmarks/backends.py` into
+      `dc1d/ops.py`; add a tolerance-based equivalence test plus a regression test
+      pinning the fp32 forcing; document backend choice in README/CLAUDE.md.
+      `DeformConv1d` already accepts `interpolation_function`, so no API change.
+- [ ] **A fused Triton kernel is NOT currently justified** (`BACKENDS.md` §5.2).
+      torchvision's hand-written C++/CUDA `deform_conv2d` is fastest in only 2/13
+      forward configs and is **4–10× slower than pure-PyTorch dc1d** in six
+      depthwise ones — the Conv-TasNet regime this package targets. `grid_sample`
+      beats it in 10/13 with no build step. Revisit only if a real training-run
+      profile shows the remaining gap matters; the two deferred fusion items above
+      are cheaper places to look first.
 
 ## Docs
 
@@ -323,9 +356,34 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       native depthwise conv on CPU in this config — that is the honest cost of a
       pure-Python gather-based implementation, and it is *not* representative of
       GPU, where the arithmetic intensity is very different.
-- [ ] **No GPU numbers.** Cannot be produced here (CPU-only torch by design).
-      **Left:** `uv run python benchmarks/benchmark.py --device cuda` on the 3090.
-      Do not quote GPU speedups until then.
+- [x] **`benchmarks/backends.py`** (was `vs_torchvision.py`) — four-way comparison
+      of dc1d, `torchvision.ops.deform_conv2d` degenerated to 1D, an `F.grid_sample`
+      backend, and tinymera's independent implementation (vendored in
+      `benchmarks/_tinymera_ref.py` from `fix/causality` @ `04593f38`).
+      `--check` (equivalence: forward, `d/d input`, `d/d offsets`), `--defects`
+      (dc1d's bug list as executable probes), `--bench`, `--mem`.
+      Results and the recommendation: **`benchmarks/BACKENDS.md`**.
+- [x] **GPU numbers now exist for the backend comparison.** RTX 3090, torch
+      2.13.0+cu129, float32, in a separate `.venv-cuda` (the dev venv stays
+      CPU-only and `torchvision` stays out of the runtime dependencies — it is in
+      the non-default `bench` group). See `BACKENDS.md` §4 for the 13-config
+      latency and `max_memory_allocated` tables.
+- [x] **Equivalence established.** dc1d, torchvision and the `grid_sample` backend
+      agree in float64 to `≤ 1.2e-12` (forward), `≤ 1.0e-12` (`d/d input`) and
+      `≤ 1.5e-14` (`d/d offsets`) on interior positions; all four agree at float32.
+      Boundary conventions genuinely differ: dc1d, `grid_sample` (`border`) and
+      tinymera **clamp**; torchvision **zero-pads**. Affects ≤ 0.05% of positions
+      at `L=16000`.
+- [ ] **Still no old-dc1d vs new-dc1d GPU comparison.** `benchmarks/benchmark.py`
+      has not been run with `--device cuda`. **Left:** run it on the 3090.
+      Do not quote a GPU figure for the *rewrite* until then — the `BACKENDS.md`
+      numbers are backend-vs-backend, not before-vs-after.
+- [ ] **Benchmarks ran with torch's Triton ATen overrides disabled**, because this
+      box has no host C compiler and torch 2.13 JIT-builds them on first use (the
+      first CUDA `einsum` raised `RuntimeError: Failed to find C compiler`). The
+      switch is global so the comparison is internally fair, but tinymera's numbers
+      are an ATen `bmm` fallback rather than its best case. **Left:** if tinymera's
+      timings ever matter for a decision, re-run on a box with `gcc` installed.
 
 ## Release
 
@@ -360,11 +418,48 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
 
 ---
 
+## Cross-repo: tinymera's independent implementation
+
+`tinymera` (private) contains a second, independently written 1D deformable
+convolution by the same author. It was audited against dc1d's seven fixed bugs;
+full table in **`benchmarks/BACKENDS.md` §3**. Reference:
+`fix/causality` @ `04593f38`, open as tinymera PR #1.
+
+- [x] Cross-audit done. Three of the seven classes recurred, one was
+      structurally impossible, two never occurred, and tinymera's fix for one
+      introduced a new defect. The correlated-mistake hypothesis holds
+      specifically for the **contract-validation** classes.
+- [ ] **Report to tinymera PR #1 — `stride > 1` is silently wrong.** The offset
+      network is built with `stride=1` hardcoded
+      (`tinymera/nn/deform_conv1d.py:175-183`) while `self.stride` goes to the
+      sampling kernel, so the module emits `T_in` offset positions instead of
+      `T_out`. Reproduced: `stride=2` returns length 64 where `nn.Conv1d` returns
+      32, tail positions all clamped to the last input sample. This is dc1d's C4,
+      half-fixed (`dilation` *is* forwarded). Survives because
+      `tests/nn/test_deform_conv1d.py` has no stride coverage.
+- [ ] **Report to tinymera PR #1 — `causal=True` leaks future context** whenever
+      `2*padding < dilation*(kernel_size-1)`, including at the module's default
+      `padding=0`. Measured `|d out[32] / d x[t'>32]| = 3.58e-01` at `padding=2`
+      (contract wants ≥ 4) and `4.45e-01` at `padding=0`. Nothing validates the
+      relationship. Neither of these two is what that PR set out to fix.
+- [ ] **Decision needed: retire tinymera's implementation** in favour of a dc1d
+      dependency (`BACKENDS.md` §5.3 recommends yes). It is slower and larger
+      than `dc1d + grid_sample` in 13/13 configs, has no `offset_groups`, and
+      cannot run in float64 — so `gradcheck` cannot be used on it at all, and it
+      has no gradcheck test.
+- [ ] **If retiring: port `causal` into dc1d.** It is the one capability tinymera
+      has that dc1d lacks and it is worth having: left-only padding, offsets
+      clamped to `≤ 0`, and — unlike tinymera — a **validated**
+      padding/dilation relationship that raises instead of silently leaking.
+
 ## Explicitly not done
 
-- Nothing was committed, branched, amended or pushed. All work is uncommitted in
-  the working tree.
-- No GPU was used and no GPU numbers are reported.
+- ~~Nothing was committed, branched, amended or pushed.~~ Superseded: the
+  modernisation work is committed, and the backend comparison lives on
+  `bench/vs-torchvision` (pushed, no PR opened).
+- ~~No GPU was used and no GPU numbers are reported.~~ Superseded for the
+  *backend comparison* only — see `benchmarks/BACKENDS.md` §4 (RTX 3090).
+  Still true for the old-vs-new rewrite comparison.
 - `py.typed` not shipped (see Packaging).
 - No CHANGELOG (see Docs).
 - CI never executed on GitHub (see CI); the YAML itself is unvalidated.

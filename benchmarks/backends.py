@@ -854,7 +854,10 @@ def _grid_sample_precision_study(device: str, report) -> int:
                     print("    [FAIL] dc1d was not bit-exact -- unexpected")
     print(
         "\n  dc1d is bit-exact at every length and dtype; grid_sample is not, and its\n"
-        "  error grows linearly with L. fp16 grid_sample is unusable past ~2k."
+        "  error grows linearly with L -- the [-1, 1] normalisation, not the dtype.\n"
+        "  The fp16 rows track the fp32 rows only because grid_sample_linterpolate\n"
+        "  forces the position arithmetic to fp32; without that they are ~1000x worse\n"
+        "  (see audit_defects probe 1)."
     )
     return failures
 
