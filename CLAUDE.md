@@ -8,6 +8,8 @@ The selling point is that it needs **no C++/CUDA compilation** — everything ri
 
 **Commits: do not add a `Co-Authored-By` trailer.**
 
+**Delegate chores and benchmarking to subagents.** Routine mechanical work — dependency bumps, lint sweeps, formatting, docstring fixes, test scaffolding, file moves — and *all* benchmarking should be dispatched to a subagent rather than done inline. Benchmarking in particular is long-running and produces a lot of output that is not worth carrying in the main context; a subagent should run the sweep and report the table and the conclusion.
+
 Use `uv` for everything — `uv run pytest`, `uv run ruff check`, `uv sync`. Do not call `pip` or a bare `python`. The dev environment pins Python 3.12 and CPU-only torch; the published wheel requires `torch>=2.4` on any supported Python.
 
 Before pushing: `uv run ruff check && uv run ruff format --check && uv run pytest`. CI runs the same across 3.10–3.13.
