@@ -44,6 +44,16 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
 ]
+# Benchmark-only. `torchvision` is NOT a dependency of dc1d -- removing it is
+# the point of the current work -- and this group is deliberately not in
+# `default-groups`, so a plain `uv sync` never installs it. It exists only so
+# that `benchmarks/vs_torchvision.py` can be run:
+#     uv sync --group bench
+#     uv run --group bench python benchmarks/vs_torchvision.py --check
+# For CUDA numbers use a separate venv; see the module docstring of that script.
+bench = [
+    "torchvision",
+]
 
 # ---------------------------------------------------------------------------
 # CPU-only torch for the development environment. The published wheel keeps a
@@ -52,6 +62,7 @@ dev = [
 # ---------------------------------------------------------------------------
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
