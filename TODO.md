@@ -271,36 +271,94 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       (TODO recorded 283 → 91 = 3.1×; agreement within RSS run-to-run variation).
       *Note:* the rewrite is in `eac995f`, **not** `50a9bed` — the latter's message
       claims the rewrite but it only touches `benchmarks/benchmark.py`.
-- [ ] **GPU speedup for the dc1d-old-vs-dc1d-new comparison is still NOT measured,
-      and neither are kernel-launch counts.** The review's "~25 kernels → ~5" and
-      "4–8× / ~10× memory" figures remain **estimates**. **Partly superseded:**
-      `benchmarks/BACKENDS.md` now has full CUDA latency and
-      `max_memory_allocated` numbers for dc1d against three *other* backends on
-      the 3090 — but that compares backends, not old-dc1d against new-dc1d.
-      **Left:** `benchmarks/benchmark.py --device cuda`, and `torch.profiler`
-      with `activities=[CUDA]` (or `nsys`) for launch counts.
+- [ ] **GPU speedup for the dc1d-old-vs-dc1d-new comparison is still NOT measured.
+      Kernel-launch counts now ARE** (`BACKENDS.md` §5.5), and the review's
+      **"~25 kernels → ~5" is half wrong**. Profiled with
+      `torch.profiler(activities=[CUDA])` at `B=4 C=64 L=4096 K=3 d=1 g=1`,
+      one warmed call:
+
+      | | fwd | fwd+bwd |
+      |---|---|---|
+      | `efficient_linterpolate` pre-rewrite (`eac995f^`) | **26** | 57 |
+      | `efficient_linterpolate` current | **23** | 44 |
+      | full layer, eager | 27 | 66 |
+      | full layer, `torch.compile` | **4** | 31 |
+
+      "~25" is accurate; "~5" is not — the eager rewrite went 26 → 23, a 12%
+      reduction, not 5×. Its real win was memory (2.9× peak RSS) and
+      correctness. **`torch.compile` is what delivers ~5**: 27 → 4 on the
+      forward. Do not quote "~25 → ~5" for the rewrite; quote it for
+      compilation. The "4–8× / ~10× memory" figures remain **estimates**.
+      **Left:** `benchmarks/benchmark.py --device cuda` for old-vs-new latency.
+- [x] **`torch.compile` benchmarked end-to-end** (`BACKENDS.md` §5). Reachable
+      only because `forward` no longer mutates `self.device`; every measurement
+      ran with `fullgraph=True`. On the RTX 3090, `mode="default"`:
+      **2.3–9.1× forward, 1.2–2.1× fwd+bwd** over eager dc1d, and it takes the
+      forward from 27 CUDA kernel launches to 4. The sampling stays **bit-exact
+      against eager** (interpolation forward, fp32 and fp64, 12/12 configs) and
+      `gradcheck` passes in float64 (§5.7).
+      *Caveats, all measured:* (a) the grouped `F.conv1d` is reassociated, so
+      the `nn.Conv1d` invariant loses **2 ulp of float64** at `groups=8` —
+      `tests/test_equivalence.py` would fail as written under compilation with
+      `groups > 1`; (b) cold-cache compile is **3.1 s forward / 8.5 s fwd+bwd**;
+      (c) every distinct sequence length is a fresh ~0.3 s compile — see the
+      dynamic-shapes item below.
+- [x] **`mode="max-autotune"` benchmarked — and rejected** (`BACKENDS.md` §5.4).
+      Worse than `mode="default"` in **8 of 10** measurements, *slower than
+      eager* in one (`medium` forward, 0.77×), reproducible only to within
+      **4.5×** between two runs of the same configuration, and **~3.5 minutes
+      per shape** from a cold cache (212 s forward, 225 s fwd+bwd) against
+      `default`'s 3.1 s. Inductor logs `out of resource: triton_depthwise_conv1d`
+      and `skipping cudagraph due to ... max re-recording limit` during those
+      compilations, so it silently falls back to different kernels between runs.
+      **Do not use it for this operator.**
+- [ ] **Dynamic shapes are unavailable for this kernel** (`BACKENDS.md` §5.6).
+      `torch._dynamo.mark_dynamic` on the length axis raises
+      `ConstraintViolationError` — the graph specialises on `L` at
+      `dc1d/ops.py:184` (`take_along_dim(...).reshape(...)`). `dynamic=True` and
+      `maybe_mark_dynamic` do not raise only because they may specialise
+      silently, which they do: **one new graph per length in all three
+      regimes**, plus a **1.7–2.1× slower steady state** for asking. For a
+      variable-length workload (i.e. speech separation, what this package is
+      for) that is ~0.3 s of Inductor compile per distinct length.
+      **Left:** find and remove the specialisation so the length axis can stay
+      symbolic; the `out_length * kernel_size` reshape is the first suspect.
 - [ ] **Deferred perf work, not attempted:**
+      - [ ] **A custom autograd `Function` for the interpolation — now the highest-value
+            item.** The forward compiles down to 4 kernel launches; the backward only
+            gets 66 → 31, and that asymmetry is the *entire* remaining gap to
+            `grid_sample`, which still wins fwd+bwd 13/13 even with both compiled
+            (`BACKENDS.md` §5.2, §5.5). Autograd currently differentiates through
+            gather+lerp and stores `x0`, `x1` and `frac`; an explicit backward needs
+            only the integer index and `frac`.
       - [ ] Fuse the two `take_along_dim` gathers. `x1` is always `x0` shifted by one
             sample, so a single gather of a `(Lo, K, 2)` window — or a `Tensor.unfold`
             over the receptive field followed by one gather — should halve the gather
-            traffic.
+            traffic. *Lower priority than it was:* Inductor already fuses the forward
+            to 4 launches, so this only helps users who do not compile.
       - [ ] Fold the interpolation and the `F.conv1d` contraction together. The
             `(B, C, Lo, K)` intermediate is the dominant allocation and never needs to
-            be materialised; a `torch.compile`-generated or hand-written fused kernel
-            would remove it.
-      - [ ] A custom autograd `Function` for the interpolation. The backward is
-            currently derived by autograd through gather+lerp, which stores `x0`, `x1`
-            and `frac`; an explicit backward only needs the integer index and `frac`.
+            be materialised. *Partly done by Inductor already* — measure peak memory
+            under `torch.compile` before hand-writing anything; `--mem` does not yet
+            cover the compiled variants.
       - [ ] `channels_last`/contiguity study — `x.reshape(B, G, C//G, L)` assumes a
             contiguous channel axis and will silently copy otherwise.
-      - [ ] Benchmark `torch.compile(mode="max-autotune")` end-to-end. Dynamo already
-            traces the layer with zero graph breaks, so this is now reachable; it was
-            not before (`self.device` mutation in `forward`).
-- [ ] **Adopt a `grid_sample` interpolation backend (opt-in).** Measured and
-      recommended in `benchmarks/BACKENDS.md` §5.1. It beats the current kernel in
-      **13/13** measured configurations on an RTX 3090: **1.6–5.3× faster forward,
-      1.4–2.6× faster fwd+bwd, 1.6–3.9× less forward memory, 2.3–5.2× less fwd+bwd
-      memory** — larger than the 1.5–2× the review estimated. `aten::grid_sampler_2d`
+- [ ] **Adopt a `grid_sample` interpolation backend (opt-in) — case now much
+      narrower.** Measured and recommended in `benchmarks/BACKENDS.md` §6.1. In
+      **eager mode** it beats the current kernel in **13/13** measured
+      configurations on an RTX 3090: **1.6–5.3× faster forward, 1.4–2.6× faster
+      fwd+bwd, 1.6–3.9× less forward memory, 2.3–5.2× less fwd+bwd memory** —
+      larger than the 1.5–2× the review estimated.
+      **But under `torch.compile` the forward advantage all but vanishes**
+      (`BACKENDS.md` §5.1): ≤ **13%**, median ~4%, and dc1d's own kernel wins
+      3 of 13. Compilation is worth 2.3–9.1× to dc1d and 0.73–1.6× to
+      `grid_sample` — it is a *regression* for `grid_sample` at four of the
+      larger forward configs, because there is nothing to fuse into
+      `aten::grid_sampler_2d`. Only the **backward** margin survives (13/13,
+      4–74%, §5.2). So: still worth adding for users who will not compile, but
+      **`torch.compile` should be the first recommendation**, and `grid_sample`
+      pitched as "for when the backward is your bottleneck and you can accept
+      the exactness loss" — not as the fast path. `aten::grid_sampler_2d`
       is an ATen builtin, so **the no-compilation property is preserved** (verified).
       `gradcheck` passes in float64 against both `input` and `offsets`, and
       `padding_mode='border'` reproduces dc1d's index clamp exactly.
@@ -316,13 +374,17 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       `dc1d/ops.py`; add a tolerance-based equivalence test plus a regression test
       pinning the fp32 forcing; document backend choice in README/CLAUDE.md.
       `DeformConv1d` already accepts `interpolation_function`, so no API change.
-- [ ] **A fused Triton kernel is NOT currently justified** (`BACKENDS.md` §5.2).
+- [ ] **A fused Triton kernel is NOT justified** (`BACKENDS.md` §6.2).
       torchvision's hand-written C++/CUDA `deform_conv2d` is fastest in only 2/13
       forward configs and is **4–10× slower than pure-PyTorch dc1d** in six
       depthwise ones — the Conv-TasNet regime this package targets. `grid_sample`
-      beats it in 10/13 with no build step. Revisit only if a real training-run
-      profile shows the remaining gap matters; the two deferred fusion items above
-      are cheaper places to look first.
+      beats it in 10/13 with no build step. **Stronger reason now: Inductor
+      already writes the fused kernel** — the compiled forward is 4 CUDA kernel
+      launches, down from 27, and lands within a few percent of `grid_sample`
+      while keeping the sampling bit-exact (§5.5). A hand-written kernel would
+      have to beat that *and* would ship as source, breaking the no-compilation
+      property. The remaining headroom is in the **backward**, and the cheap fix
+      there is the custom autograd `Function` above, not Triton.
 
 ## Docs
 
@@ -384,6 +446,16 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       switch is global so the comparison is internally fair, but tinymera's numbers
       are an ATen `bmm` fallback rather than its best case. **Left:** if tinymera's
       timings ever matter for a decision, re-run on a box with `gcc` installed.
+      *Update:* the `torch.compile` work (`BACKENDS.md` §5) needed a compiler —
+      Triton builds a CUDA driver shim with `$CC` before Inductor can emit
+      anything — so one was introduced *inside the throwaway CUDA venv only*
+      (`uv pip install ziglang`, plus a one-line `cc` shim; nothing was installed
+      system-wide, so the "no host C compiler" statement above still holds for
+      the box). `backends.py` gained `--triton-overrides {auto,off,on}` and §5
+      pins it `off`, because otherwise the mere presence of a compiler would have
+      flipped the override state and made the compiled numbers incomparable with
+      §4. The check that this worked: §5's eager columns reproduce §4.1 to within
+      a few percent.
 
 ## Release
 
@@ -443,7 +515,7 @@ full table in **`benchmarks/BACKENDS.md` §3**. Reference:
       (contract wants ≥ 4) and `4.45e-01` at `padding=0`. Nothing validates the
       relationship. Neither of these two is what that PR set out to fix.
 - [ ] **Decision needed: retire tinymera's implementation** in favour of a dc1d
-      dependency (`BACKENDS.md` §5.3 recommends yes). It is slower and larger
+      dependency (`BACKENDS.md` §6.3 recommends yes). It is slower and larger
       than `dc1d + grid_sample` in 13/13 configs, has no `offset_groups`, and
       cannot run in float64 — so `gradcheck` cannot be used on it at all, and it
       has no gradcheck test.
