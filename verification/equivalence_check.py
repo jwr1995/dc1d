@@ -27,6 +27,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import torch
@@ -42,6 +43,7 @@ def _purge() -> None:
 
 
 def _load(root: str):
+    root = os.path.abspath(root)
     _purge()
     sys.path.insert(0, root)
     try:

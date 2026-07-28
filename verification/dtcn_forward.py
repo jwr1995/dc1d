@@ -28,6 +28,7 @@ paper reports -- and the forward pass reproduces the inference branch of
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -53,8 +54,9 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
+    args.dc1d_root = os.path.abspath(args.dc1d_root)
     sys.path.insert(0, args.dc1d_root)
-    sys.path.insert(0, f"{args.dtcn}/separation")
+    sys.path.insert(0, os.path.abspath(f"{args.dtcn}/separation"))
 
     import torch
     import torchaudio

@@ -1,0 +1,239 @@
+dc1d equivalence evidence
+  torch          2.13.0+cu130 (CUDA 13.0)
+  device         cuda:0 = NVIDIA GeForce RTX 3090
+  TF32           cudnn=False matmul=False
+  OLD            /home/will/scratch-dc1d/old/dc1d/nn.py
+  NEW            /home/will/scratch-dc1d/new/dc1d/nn.py
+  seed           20260728
+
+==============================================================================
+A1. Zero-offset nn.Conv1d equivalence (the load-bearing invariant)
+==============================================================================
+torch.equal against nn.Conv1d with identical weights, constrained mode.
+
+device  dtype     k  d  s  g  OLD==conv  NEW==conv  OLD==NEW
+cpu     float64   3  1  1  1  True       True       True
+cpu     float64   3  4  1  1  True       True       True
+cpu     float64   5  2  3  1  True       True       True
+cpu     float64   3  2  1  4  True       True       True
+cpu     float64   3  8  1  1  True       True       True
+cpu     float32   3  1  1  1  True       True       True
+cpu     float32   3  4  1  1  True       True       True
+cpu     float32   5  2  3  1  True       True       True
+cpu     float32   3  2  1  4  True       True       True
+cpu     float32   3  8  1  1  True       True       True
+cuda:0  float64   3  1  1  1  True       True       True
+cuda:0  float64   3  4  1  1  True       True       True
+cuda:0  float64   5  2  3  1  True       True       True
+cuda:0  float64   3  2  1  4  True       True       True
+cuda:0  float64   3  8  1  1  True       True       True
+cuda:0  float32   3  1  1  1  True       True       True
+cuda:0  float32   3  4  1  1  True       True       True
+cuda:0  float32   5  2  3  1  True       True       True
+cuda:0  float32   3  2  1  4  True       True       True
+cuda:0  float32   3  8  1  1  True       True       True
+
+==============================================================================
+A2. Forward, non-trivial random offsets, constrained, groups=1, stride=1
+==============================================================================
+Is OLD bit-identical to NEW? float32 rows are additionally scored against
+a float64 evaluation; the last column is how far the two float64
+evaluations are from each other, i.e. how well defined that reference is.
+
+dtype           L torch.equal  max|OLD-NEW|  err(OLD) vs f64  err(NEW) vs f64  f64 OLD vs NEW
+float64        64 False          1.0658e-14              nan              nan        1.07e-14
+float64       256 False          4.6407e-14              nan              nan        4.64e-14
+float64      4096 False          9.9631e-13              nan              nan        9.96e-13
+float64     65536 False          1.8607e-11              nan              nan        1.86e-11
+float64   1048576 False          3.3876e-10              nan              nan        3.39e-10
+float32        64 False          4.7684e-06       4.8090e-06       7.3097e-07        0.00e+00
+float32       256 False          2.5570e-05       2.6012e-05       9.2462e-07        1.11e-16
+float32      4096 False          5.8633e-04       5.8634e-04       1.2793e-06        2.22e-16
+float32     65536 False          1.0780e-02       1.0780e-02       1.4294e-06        4.44e-16
+float32   1048576 False          1.8234e-01       1.8234e-01       1.6139e-06        8.88e-16
+
+==============================================================================
+A2b. Analytic ground truth: x[i] = i mod 2
+==============================================================================
+With a 0/1 sawtooth input the two gathered samples are exactly 0 and 1, so
+linear interpolation at position `index + f` returns exactly `f` (even index)
+or `1 - f` (odd index). The output is O(1) while the positions are large, so
+this isolates the error in the sub-sample fraction. Positions are computed
+here in exact integer arithmetic and the reference depends on neither
+implementation. Offsets are drawn so that no tap sits on the clamp.
+
+dtype           L   max err OLD   max err NEW         eps
+float64       256    1.4211e-14    0.0000e+00    2.22e-16
+float64      4096    2.2737e-13    0.0000e+00    2.22e-16
+float64     65536    3.6380e-12    0.0000e+00    2.22e-16
+float64   1048576    5.8208e-11    0.0000e+00    2.22e-16
+float32       256    7.8678e-06    2.3842e-07    1.19e-07
+float32      4096    1.2231e-04    2.3842e-07    1.19e-07
+float32     65536    1.9533e-03    2.3842e-07    1.19e-07
+float32   1048576    3.1250e-02    2.3842e-07    1.19e-07
+
+==============================================================================
+A3. When IS the forward bit-identical?
+==============================================================================
+case                       torch.equal max|OLD-NEW|
+zero offsets               True        0.0000e+00
+integer offsets            True        0.0000e+00
+half-integer offsets       False       1.1921e-07
+quarter-integer offsets    False       1.1921e-07
+random offsets             False       4.7684e-06
+
+==============================================================================
+A4. Gradients, random offsets, constrained, groups=1, stride=1, float32
+==============================================================================
+       L  grad   torch.equal  max|OLD-NEW|  err(OLD) vs f64  err(NEW) vs f64  |grad| scale
+     256  d/dx   False          2.7418e-05       2.7432e-05       5.0784e-07    5.0809e+00
+     256  d/doff False          9.5367e-07       4.1129e-07       5.6364e-07    9.0022e+00
+    4096  d/dx   False          7.4816e-04       7.4800e-04       7.1465e-07    7.3820e+00
+    4096  d/doff False          6.4660e+00       6.4660e+00       9.8253e-07    1.3177e+01
+   65536  d/dx   False          1.2087e-02       1.2087e-02       8.3407e-07    8.3202e+00
+   65536  d/doff False          8.7981e+00       8.7981e+00       1.3545e-06    1.4582e+01
+
+==============================================================================
+A5. Gradient w.r.t. offsets where sampling positions land on integers
+==============================================================================
+Interpolation weights sum to 1, so d(out)/d(offset) must be invariant to
+adding a constant to the input. Test: zero offsets, then x -> x + 1000.
+
+  OLD: d/doffset[0,0,0,:] = [0.105268, -0.505334, 0.035734]
+       shift-invariance violation max|grad(x+1000) - grad(x)| = 5.0000e+02
+  NEW: d/doffset[0,0,0,:] = [1.574364, -1.431742, 1.153603]
+       shift-invariance violation max|grad(x+1000) - grad(x)| = 1.0547e-13
+  x[0:4] = [-1.153291, 0.421073, -1.010669, 0.142935]
+  analytic right-derivative at tap j = x[j+1]-x[j]:  [1.574364, -1.431742, 1.153603]
+  OLD instead returns 0.5*x[j+1] from the `torch.max(zeros, 1-|U+1-T|)` tie,
+  halved again at the two taps that also sit on the constrained clamp
+  boundary (`torch.max(T, t0s)` and `torch.min(T, t0s+max_tap)`), which for
+  k=3, d=1, zero offsets is taps 0 and 2:
+    0.25*x[1], 0.5*x[2], 0.25*x[3] = [0.105268, -0.505334, 0.035734]
+
+==============================================================================
+B1. fp16 offsets: position arithmetic inherits the offset dtype in 0.0.7
+==============================================================================
+Rows counted as wrong if max|value - fp64 reference| > 1e-3 anywhere in the row.
+
+      L  out_len  OLD dtype  NEW dtype  OLD rows wrong  NEW rows wrong  OLD max err  NEW max err
+    256      254    float32    float16             233               7       0.2126       0.0020
+   1024     1022    float32    float16             991              38       0.8667       0.0022
+   2048     2046    float32    float16            2012              61       1.8585       0.0021
+   4096     4094    float32    float16            4046             114       5.0977       0.0025
+  16000    15998    float32    float16           15958             487       7.0830       0.0025
+
+==============================================================================
+B2. Unconstrained mode near the right-hand edge
+==============================================================================
+x = ones, so the output equals the sum of the two interpolation weights.
+A correct kernel returns 1.0 for every in-range sampling position.
+
+ sampling position T  OLD weight sum  NEW weight sum
+                 0.0        1.000000        1.000000
+                 8.0        1.000000        1.000000
+                14.0        1.000000        1.000000
+                14.5        1.000000        1.000000
+                15.0        1.000000        1.000000
+                15.5        0.500000        1.000000
+                16.0        0.000000        1.000000
+
+==============================================================================
+B3. PackedDeformConv1d output length vs nn.Conv1d, padding='valid'
+==============================================================================
+0.0.7 builds offset_dconv as nn.Conv1d(..., stride=1, <no dilation>),
+so it emits the wrong number of offset positions.
+
+stride dilation  nn.Conv1d                OLD    NEW
+     1        1         62                 62     62
+     2        1         31           62 WRONG     31
+     1        4         56           62 WRONG     56
+     3        2         20           62 WRONG     20
+     4        8         12           62 WRONG     12
+
+==============================================================================
+B4. offset_groups strictly between 1 and in_channels
+==============================================================================
+  OLD PackedDeformConv1d(offset_groups=2): AssertionError: offset_groups only implemented for offset_groups in {1,in_channels}
+  NEW PackedDeformConv1d(offset_groups=2): ok, output (1, 8, 30)
+  OLD DeformConv1d, offsets with 2 groups:  RuntimeError: Size does not match at dimension 1 expected index [1, 16, 30, 2] to be no larger than self
+  NEW DeformConv1d, offsets with 2 groups:  ok, output (1, 8, 30)
+
+==============================================================================
+B5. repr(layer)
+==============================================================================
+  OLD: TypeError: object of type 'int' has no len()
+  NEW: DeformConv1d(8, 8, kernel_size=3, stride=1, padding='valid', padding_mode=reflect)
+
+==============================================================================
+B7. Integer padding with padding_mode='zeros' (extra fix, not on the brief)
+==============================================================================
+0.0.7's forward pads only when padding_mode != 'zeros' or padding == 'same',
+so an int padding with padding_mode='zeros' is silently not applied; the
+index clamp then absorbs the shape error and returns a plausible wrong answer.
+
+  OLD: out_len=16 (nn.Conv1d 16), torch.equal to nn.Conv1d = False, max|d|=1.3869e+00
+  NEW: out_len=16 (nn.Conv1d 16), torch.equal to nn.Conv1d = True, max|d|=0.0000e+00
+
+==============================================================================
+C. gather_lerp variants of 0.1.0 against its own default ('autograd')
+==============================================================================
+device  dtype    impl       fwd equal  d/dx equal   max|d/dx diff| d/doff equal   max|d/doff diff|
+cpu     float64  recompute  True       False            1.7764e-15 True                 0.0000e+00
+cpu     float64  save-diff  True       False            1.7764e-15 True                 0.0000e+00
+cpu     float32  recompute  True       False            4.7684e-07 True                 0.0000e+00
+cpu     float32  save-diff  True       False            4.7684e-07 True                 0.0000e+00
+cuda:0  float64  recompute  True       False            8.8818e-16 True                 0.0000e+00
+cuda:0  float64  save-diff  True       False            8.8818e-16 True                 0.0000e+00
+cuda:0  float32  recompute  True       False            4.7684e-07 True                 0.0000e+00
+cuda:0  float32  save-diff  True       False            4.7684e-07 True                 0.0000e+00
+
+d/dx accuracy of each variant against a float64 reference (float32, cuda):
+  autograd   max|d/dx - fp64| = 7.9519e-07
+  recompute  max|d/dx - fp64| = 6.2073e-07
+  save-diff  max|d/dx - fp64| = 6.2073e-07
+
+Run-to-run determinism of d/dx (same inputs, two runs), float32:
+  cpu     autograd   torch.equal = True
+  cpu     recompute  torch.equal = True
+  cpu     save-diff  torch.equal = True
+  cuda:0  autograd   torch.equal = False
+  cuda:0  recompute  torch.equal = False
+  cuda:0  save-diff  torch.equal = False
+
+==============================================================================
+R1. User-supplied non-integer `dilated_positions`
+==============================================================================
+0.0.7 treated `dilated_positions` as arbitrary float tap positions and
+interpolated them. 0.1.0's `_dilated_positions_long` does .round().long().
+
+  tap positions requested: [0.0, 1.5, 3.7]
+  OLD output taps: [-0.884192, 0.391088, -0.239427]
+  NEW output taps: [-0.884192, 0.188965, 0.797067]
+  x[0:5]         : [-0.884192, 0.593211, 0.188965, -2.657912, 0.797067]
+  torch.equal = False  (NEW == x at integer indices 0, 2, 4)
+
+==============================================================================
+R2. Out-of-range offsets, constrained mode
+==============================================================================
+  offset=   -50.0: equal=True  max|d|=0.0000e+00 rms=0.0000e+00
+  offset=    -1.0: equal=True  max|d|=0.0000e+00 rms=0.0000e+00
+  offset=   +50.0: equal=True  max|d|=0.0000e+00 rms=0.0000e+00
+
+==============================================================================
+R3. Subgradient exactly at the constrained clamp boundary
+==============================================================================
+  tap pinned to upper bound: OLD d/doff[0,0,0,:]=[0.1913, 0.0, 0.0] NEW=[-0.1395, 0.0, 0.0] equal=False
+  tap pinned to lower bound: OLD d/doff[0,0,0,:]=[0.0, 0.0, -0.2643] NEW=[0.0, 0.0, 0.1584] equal=False
+
+==============================================================================
+R4. PackedDeformConv1d state_dict portability, 0.0.7 -> 0.1.0
+==============================================================================
+The offset_dconv weight has the same shape either way, so a 0.0.7
+checkpoint loads with strict=True and then computes different offsets.
+
+dilation stride  strict load  offsets equal  max|offset diff|  max|output diff|  output scale
+       1      1           ok           True        0.0000e+00        3.6046e-05    2.8889e+00
+       2      1           ok          False        4.7578e+00        2.5967e+00    2.6818e+00
+       4      1           ok          False        4.7111e+00        2.5327e+00    2.3381e+00
+     128      1           ok          False        5.4471e+00        2.8274e+00    2.9762e+00
