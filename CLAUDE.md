@@ -44,7 +44,14 @@ These are all fixed. They are listed because the same classes of bug are easy to
 
 ## Benchmarking
 
-GPU numbers are **not** currently measured — the dev environment is CPU-only torch. The committed figures (2.8–3.4× forward, 3.5–4.4× fwd+bwd, 283→91 MiB peak RSS) are CPU wall-clock and CPU RSS. Do not quote GPU speedups until the benchmarks are run on CUDA; TODO.md tracks this.
+Two separate sets of numbers exist; do not confuse them.
+
+- **`benchmarks/benchmark.py`** compares old-dc1d against new-dc1d, and has only ever run on **CPU** — the default dev environment is CPU-only torch. Its figures (2.8–3.4× forward, 3.5–4.4× fwd+bwd, 283→91 MiB peak RSS) are CPU wall-clock and CPU RSS. The GPU equivalent of *that* comparison is still unmeasured.
+- **`benchmarks/BACKENDS.md`** compares dc1d against three other backends on **CUDA** (3090), eager and compiled, with peak `max_memory_allocated`. Those are real GPU numbers.
+
+Profiled launch counts, since the estimate was wrong and is still quoted in older commit messages: the rewrite moved the interpolation from **26 to 23** kernels — a 12% cut, not the ~5× that was projected. Its win was memory and correctness. `torch.compile` is what actually delivers the reduction (forward 27→4; backward only 66→31, which is why the compiled backward still trails `grid_sample` and why a custom autograd `Function` is the highest-value item left in TODO.md).
+
+Dynamic shapes are unavailable: `mark_dynamic` on the length axis raises `ConstraintViolationError` because the graph specialises on `L` (`dc1d/ops.py:184`). `dynamic=True` does not raise only because it specialises silently — one graph per distinct length, plus a slower steady state for asking. For variable-length speech that is roughly 0.3 s of compile per new length.
 
 Always `torch.cuda.synchronize()` around GPU timing, or use `torch.utils.benchmark`. Give both sides of any comparison the same warmup — an earlier benchmark gave the deformable path three warmup iterations against a vanilla conv's one cold call, including cuDNN algorithm selection.
 
