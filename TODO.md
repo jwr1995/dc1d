@@ -393,7 +393,9 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
             only variant with capability restrictions. It is kept because it
             separates the cost of the saved difference from the cost of the
             recomputation, which is what makes §5.9.4's accounting checkable.
-      - [ ] README does not yet mention `gather_lerp`.
+      - [x] README now documents `gather_lerp` under "Going faster, and using
+            less memory", with the `functools.partial` opt-in and the measured
+            trade-off. The snippet was executed.
 - [ ] **Deferred perf work, not attempted:**
       - [ ] Fuse the two `take_along_dim` gathers. `x1` is always `x0` shifted by one
             sample, so a single gather of a `(Lo, K, 2)` window — or a `Tensor.unfold`

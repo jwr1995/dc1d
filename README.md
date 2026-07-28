@@ -115,6 +115,41 @@ y = model(torch.rand(4, 64, 256))
 # y, offsets = model(x, with_offsets=True)  # if you want the offsets too
 ```
 
+### Going faster, and using less memory
+
+Nothing below changes what the layer returns — the forward stays bit-for-bit
+identical, including the invariant that zero offsets reproduce `nn.Conv1d`
+exactly.
+
+**`torch.compile` first.** The layer traces to a single graph with no breaks, so
+`torch.compile(model)` works with `fullgraph=True` and is worth **2.3–9.1×** on
+the forward and **1.2–2.1×** on forward+backward on an RTX 3090. Note that every
+distinct sequence length is a separate compilation (~0.3 s), which matters for
+variable-length audio.
+
+**Then trade a little backward latency for a lot of memory.** The default
+backward keeps ~7× the sampled tensor alive between the forward and the
+backward. An alternative backward keeps ~1×:
+
+```python
+import functools
+from dc1d.nn import DeformConv1d
+from dc1d.ops import efficient_linterpolate
+
+model = DeformConv1d(
+    in_channels=512, out_channels=512, kernel_size=3, padding="same",
+    interpolation_function=functools.partial(
+        efficient_linterpolate, gather_lerp="recompute"
+    ),
+)
+```
+
+Measured: **1.6–2.1× lower peak memory** in eager mode for **10–23% slower**
+forward+backward, and under `torch.compile` it is **both** 0–12% faster *and*
+1.3–1.9× smaller — so if you compile, there is no reason not to use it. Full
+numbers, including why the hand-written backward does *not* make eager faster,
+are in [`benchmarks/BACKENDS.md`](benchmarks/BACKENDS.md) §5.9.
+
 ### Examples and benchmarks
 
 ```
