@@ -23,8 +23,8 @@ Environment used for verification: `uv` 0.11.32, CPython 3.12.13,
       (explicit index, so only `torch` is pulled from it). The published wheel keeps
       a plain `torch>=2.4`, so end users still get whatever build pip resolves.
 - [x] `__version__` added to `dc1d/__init__.py:15`; hatchling reads it via
-      `[tool.hatch.version] path = "dc1d/__init__.py"`. Version left at `0.0.7` —
-      **bumping it is a release decision for the owner** (see Release below).
+      `[tool.hatch.version] path = "dc1d/__init__.py"`. Bumped `0.0.7` → **`0.1.0`**
+      for the breaking changes in this pass (see Release below).
 - [x] `dc1d/__init__.py` now re-exports `DeformConv1d`, `PackedDeformConv1d`,
       `gLN`, `cLN` and the three interpolation kernels. It previously exported nothing.
 - [x] `[tool.ruff]` config added (line-length 100, `E/F/I/UP/B/W`). `ruff check .`
@@ -351,11 +351,10 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
          `push: tags: ["v*"]` trigger *and* rename the file to `release.yml`.
          Recommendation: keep `workflow_dispatch` for a first TestPyPI dry run,
          then switch to tags.
-      5. **Version bump.** Still `0.0.7`, the same as the version currently on PyPI.
-         This pass contains breaking changes (`self.device` removed, offset-shape
-         mismatches now raise, `requires-python >= 3.10`), so `0.1.0` is the
-         suggested next version — but that is the owner's call, and nothing here
-         has bumped it.
+      5. ~~**Version bump.**~~ Done: `0.0.7` → **`0.1.0`**, for the breaking changes
+         in this pass (`self.device` removed, offset-shape mismatches now raise,
+         `requires-python >= 3.10`). PyPI still has `0.0.7`, so the first publish
+         from this line will be `v0.1.0`.
       6. **Rename** `release.yml.disabled` → `release.yml` as the last step.
 
 ---

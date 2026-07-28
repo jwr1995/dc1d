@@ -12,7 +12,7 @@ from dc1d.ops import (
     kernel_width_linterpolate,
 )
 
-__version__ = "0.0.7"
+__version__ = "0.1.0"
 
 __all__ = [
     "DeformConv1d",
