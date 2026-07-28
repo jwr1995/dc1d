@@ -2,7 +2,7 @@
 
 Four implementations of the same operator, measured against each other:
 numerical equivalence (forward **and** both gradients), a defect cross-audit,
-latency, and peak memory.
+latency, and peak memory — **eager (§4) and under `torch.compile` (§5)**.
 
 Everything here is reproduced by `benchmarks/backends.py`. Figures labelled
 **measured** come from a run of that script on the hardware below; anything
@@ -12,7 +12,14 @@ labelled **estimated** is arithmetic, not measurement, and is marked as such.
 uv sync --group bench
 uv run --group bench python benchmarks/backends.py --check --defects   # CPU
 .venv-cuda/bin/python benchmarks/backends.py --all --device cuda:0     # CUDA
+CC=<a C compiler> .venv-cuda/bin/python benchmarks/backends.py \
+    --compile-all --device cuda:0 --triton-overrides off               # §5
 ```
+
+> **Read §5 before acting on §6.1.** The `grid_sample` recommendation was
+> established in eager mode. Under `torch.compile` its forward advantage over
+> dc1d's own kernel falls from **1.6–5.3×** to **≤ 13%**, which changes what the
+> right default advice is.
 
 **Hardware and versions** (all measured figures below come from this machine):
 
@@ -258,7 +265,7 @@ against `feature/exciting-plc`), which is "post-fix". "Pre-fix" is
 
 ### D1 — the candidate `grid_sample` backend is exposed to this too
 
-Worth stating plainly, because it bears on §5.1. `efficient_linterpolate` is
+Worth stating plainly, because it bears on §6.1. `efficient_linterpolate` is
 immune to D1 by construction: it keeps the window start in `long` and only the
 sub-sample fraction ever touches the input dtype. **A `grid_sample` backend
 cannot do that** — `grid_sample`'s only input is one normalised float
@@ -476,16 +483,343 @@ The commit messages and their contents are misaligned in that pair.
 
 ---
 
-## 5. Recommendation
+## 5. Under `torch.compile`
 
-### 5.1 Should dc1d adopt a `grid_sample` backend? — **Yes, as an opt-in backend.**
+Everything in §4 was measured in **eager mode**, and that is not a neutral
+choice. `grid_sample` is a single opaque ATen kernel: Inductor can call it but
+cannot fuse anything into it. dc1d's kernel is the opposite — two
+`take_along_dim` gathers wrapped in a `floor`/`clamp`/`sub`/`where`/`lerp`
+elementwise chain, which is exactly the shape Inductor exists to fuse. If dc1d's
+kernel is memory-bandwidth-bound rather than compute-bound, compilation should
+help it *more*, and the §4 comparison may be measuring the wrong thing.
 
-The measurements support it decisively, and the deciding constraint holds:
+This became testable only after PR #9. `DeformConv1d.forward` used to mutate
+`self.device`, which forced a graph break; with that gone and
+`dilated_positions` a non-persistent buffer, `torch._dynamo.explain` reports
+**0 graph breaks / 1 graph** and every compilation below runs with
+`fullgraph=True`.
 
-* **It is faster and smaller in 13/13 configurations**, forward and
-  forward+backward: 1.6–5.3× faster forward, 1.4–2.6× faster fwd+bwd, 1.6–3.9×
-  less forward memory, 2.3–5.2× less fwd+bwd memory. dc1d's own review
-  estimated 1.5–2×; the measured win is larger.
+Reproduce with:
+
+```
+CC=<a C compiler> .venv-cuda/bin/python benchmarks/backends.py \
+    --compile-all --device cuda:0 --triton-overrides off
+```
+
+> **Two disclosures about the environment.**
+>
+> 1. **A C compiler had to be introduced.** Triton builds a small CUDA driver
+>    shim with `$CC` on first use, so Inductor cannot run at all on this box as
+>    configured. The measurements use `zig cc` from the `ziglang` PyPI wheel —
+>    self-contained, installed into the throwaway CUDA venv, nothing added to
+>    the system.
+> 2. **`--triton-overrides off` is load-bearing.** `maybe_disable_triton_overrides`
+>    keys off the presence of a compiler, so simply installing one would have
+>    flipped torch 2.13's Triton ATen overrides from *disabled* (how §4 was
+>    measured) to *enabled*, silently re-dispatching ops for **every** backend.
+>    Pinning them off keeps the dispatch regime byte-identical to §4 and leaves
+>    `torch.compile` as the only variable that moved. The check that this
+>    worked is in the tables themselves: the eager `dc1d` and `gs` columns below
+>    are fresh measurements, and they reproduce §4.1 to within a few percent.
+
+Notation: `/c` is `torch.compile(mode="default")`, `/ma` is
+`mode="max-autotune"`. Bracketed factors are **eager dc1d / variant**, so
+`> 1×` means faster than the eager default kernel. ⚠ marks rows where a second
+independent run disagreed by more than 20% — see §5.7.
+
+### 5.1 Latency — forward (ms)
+
+| config | dc1d | dc1d/c | grid_sample | grid_sample/c | torchvision/c |
+|---|---|---|---|---|---|
+| B=1 C=16 L=256 K=3 d=1 g=1 | 0.304 | 0.130 (2.33×) | 0.178 (1.71×) | **0.113 (2.69×)** | 0.241 (1.26×) |
+| B=4 C=64 L=1024 K=3 d=1 g=1 | 0.317 | 0.133 (2.38×) | 0.196 (1.62×) | **0.127 (2.49×)** | 0.241 (1.31×) |
+| B=4 C=64 L=1024 K=3 d=1 g=64 | 0.287 | 0.111 (2.59×) | 0.165 (1.74×) | **0.105 (2.73×)** | 1.777 (0.16×) |
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 0.533 | **0.143 (3.74×)** | 0.177 (3.01×) | 0.147 (3.64×) | 6.402 (0.08×) |
+| B=4 C=256 L=2048 K=3 d=8 g=1 | 0.703 | **0.289 (2.43×)** | 0.344 (2.05×) | 0.294 (2.39×) | 0.362 (1.94×) |
+| B=4 C=128 L=4096 K=15 d=1 g=1 | 2.798 | 1.150 (2.43×) | 1.032 (2.71×) | 1.126 (2.48×) | **0.920 (3.04×)** |
+| B=4 C=128 L=4096 K=15 d=1 g=128 ⚠ | 2.181 | 0.555 (3.93×) | **0.424 (5.15×)** | 0.530 (4.12×) | 3.405 (0.64×) |
+| B=4 C=128 L=4096 K=3 d=2 g=1 | 0.321 | 0.136 (2.35×) | 0.197 (1.62×) | **0.130 (2.47×)** | 0.250 (1.29×) |
+| B=4 C=128 L=4096 K=3 d=1 g=1 ⚠ | 0.698 | 0.241 (2.90×) | 0.264 (2.64×) | **0.237 (2.95×)** | 0.275 (2.54×) |
+| B=1 C=256 L=16000 K=3 d=1 g=256 | 0.989 | 0.289 (3.42×) | **0.260 (3.80×)** | 0.280 (3.53×) | 6.556 (0.15×) |
+| B=4 C=256 L=16000 K=3 d=8 g=256 ⚠ | 3.753 | 1.100 (3.41×) | **0.821 (4.57×)** | 1.119 (3.35×) | 5.905 (0.64×) |
+| B=1 C=256 L=16000 K=3 d=1 g=1 ⚠ | 1.311 | 0.568 (2.31×) | 0.581 (2.25×) | **0.558 (2.35×)** | 0.707 (1.85×) |
+| B=8 C=512 L=8000 K=3 d=1 g=512 ⚠ | 24.042 | 2.630 (9.14×) | 11.590 (2.07×) | **2.395 (10.04×)** | 11.348 (2.12×) |
+
+### 5.2 Latency — forward+backward (ms)
+
+| config | dc1d | dc1d/c | grid_sample | grid_sample/c | torchvision/c |
+|---|---|---|---|---|---|
+| B=1 C=16 L=256 K=3 d=1 g=1 | 0.785 | 0.425 (1.85×) | 0.478 (1.64×) | **0.400 (1.97×)** | 0.674 (1.16×) |
+| B=4 C=64 L=1024 K=3 d=1 g=1 | 0.799 | 0.471 (1.70×) | 0.520 (1.54×) | **0.454 (1.76×)** | 0.667 (1.20×) |
+| B=4 C=64 L=1024 K=3 d=1 g=64 | 0.752 | 0.464 (1.62×) | 0.470 (1.60×) | **0.425 (1.77×)** | 4.637 (0.16×) |
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 1.540 | 0.996 (1.55×) | 0.681 (2.26×) | **0.647 (2.38×)** | 18.366 (0.08×) |
+| B=4 C=256 L=2048 K=3 d=8 g=1 | 2.210 | 1.637 (1.35×) | 1.343 (1.65×) | **1.276 (1.73×)** | 1.569 (1.41×) |
+| B=4 C=128 L=4096 K=15 d=1 g=1 ⚠ | 6.970 | 4.717 (1.48×) | 3.148 (2.21×) | **3.090 (2.26×)** | 4.546 (1.53×) |
+| B=4 C=128 L=4096 K=15 d=1 g=128 | 8.700 | 6.459 (1.35×) | 4.797 (1.81×) | **4.767 (1.83×)** | 9.367 (0.93×) |
+| B=4 C=128 L=4096 K=3 d=2 g=1 | 0.867 | 0.540 (1.61×) | 0.589 (1.47×) | **0.510 (1.70×)** | 0.750 (1.16×) |
+| B=4 C=128 L=4096 K=3 d=1 g=1 ⚠ | 1.896 | 1.541 (1.23×) | 0.917 (2.07×) | **0.884 (2.14×)** | 1.211 (1.57×) |
+| B=1 C=256 L=16000 K=3 d=1 g=256 ⚠ | 2.907 | 1.935 (1.50×) | **1.162 (2.50×)** | 1.219 (2.38×) | 25.417 (0.11×) |
+| B=4 C=256 L=16000 K=3 d=8 g=256 | 11.104 | 7.533 (1.47×) | **4.347 (2.55×)** | 4.700 (2.36×) | 17.863 (0.62×) |
+| B=1 C=256 L=16000 K=3 d=1 g=1 | 5.684 | 4.627 (1.23×) | 3.932 (1.45×) | 3.911 (1.45×) | **2.789 (2.04×)** |
+| B=8 C=512 L=8000 K=3 d=1 g=512 ⚠ | 44.757 | 20.923 (2.14×) | 23.590 (1.90×) | **15.758 (2.84×)** | 41.919 (1.07×) |
+
+### 5.3 What the numbers say
+
+**The hypothesis holds. Compilation helps dc1d's kernel a lot and `grid_sample`
+barely at all.**
+
+| | dc1d → dc1d/c | grid_sample → grid_sample/c |
+|---|---|---|
+| forward | **2.31× – 9.14×** (13/13 faster) | **0.73× – 4.84×** (9/13 faster; *slower* in 4) |
+| forward+backward | 1.23× – 2.14× (13/13) | 1.03× – 1.50× (13/13) |
+
+Compiling `grid_sample` is a **regression** at four of the larger forward
+configurations — `wide-kernel` (0.92×), `wide-kernel-dw` (0.80×),
+`speech-1x256` (0.93×) and `speech-4x256` (0.73×). There is nothing for
+Inductor to fuse into `aten::grid_sampler_2d`, so what it adds is bookkeeping.
+dc1d's chain, by contrast, collapses into the gather epilogues exactly as
+predicted: §5.5 shows the forward going from **27 CUDA kernel launches to 4**.
+
+**Forward: the gap essentially closes.**
+
+| | eager (§4.1) | compiled (§5.1) |
+|---|---|---|
+| grid_sample vs dc1d, forward | **1.62× – 5.27×**, 13/13 wins | **1.03× – 1.15×**, 10/13 wins |
+
+Once both are compiled the largest remaining forward margin is **13%**
+(`tiny`), the median is **~4%**, and dc1d/c is actually *faster* in 3 of 13
+(`medium`, `medium-dense`, `speech-4x256`). A 1.6–5.3× advantage has become a
+few percent.
+
+**Forward+backward: the gap narrows but does not close.**
+
+| | eager (§4.2) | compiled (§5.2) |
+|---|---|---|
+| grid_sample vs dc1d, fwd+bwd | **1.44× – 2.62×**, 13/13 wins | **1.04× – 1.74×**, 13/13 wins |
+
+`grid_sample/c` still wins every configuration, by 4%–74% (median ~33%). The
+backward is where dc1d pays: autograd differentiates through gather + lerp and
+must store `x0`, `x1` and `frac`, and the resulting scatter-adds fuse far less
+well than the forward — 66 launches to 31, against the forward's 27 to 4.
+**This is the single most valuable place to look next**, and it is already a
+deferred item in `TODO.md`: a custom autograd `Function` for the interpolation
+needs only the integer index and `frac`, not `x0` and `x1`.
+
+**torchvision's compiled kernel is unchanged and still erratic** — 0.08×–3.04×
+against eager dc1d, catastrophic in the depthwise configurations. Inductor
+cannot improve an opaque custom op, which is the point.
+
+### 5.4 `max-autotune` is not reliable here
+
+Capped grid (5 configurations), eager and both modes measured in the same
+round-robin. **Forward (ms):**
+
+| config | dc1d | dc1d/c | dc1d/ma | gs | gs/c | gs/ma |
+|---|---|---|---|---|---|---|
+| B=4 C=64 L=1024 K=3 d=1 g=1 | 0.320 | **0.134** | 0.143 | 0.198 | 0.127 | 0.137 |
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 0.537 | **0.145** | 0.153 | 0.178 | 0.150 | 0.154 |
+| B=4 C=128 L=4096 K=15 d=1 g=128 | 2.195 | **0.603** | 0.916 | 0.426 | 0.621 | 1.187 |
+| B=4 C=256 L=16000 K=3 d=8 g=256 | 3.770 | **1.210** | 1.542 | 0.911 | 2.151 | 2.209 |
+| B=1 C=256 L=16000 K=3 d=1 g=1 | 1.317 | **0.583** | 0.762 | 0.582 | 0.604 | 0.836 |
+
+**Forward+backward (ms):**
+
+| config | dc1d | dc1d/c | dc1d/ma | gs | gs/c | gs/ma |
+|---|---|---|---|---|---|---|
+| B=4 C=64 L=1024 K=3 d=1 g=1 | 0.852 | 0.530 | **0.402** | 0.584 | 0.517 | 0.384 |
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 1.552 | **1.005** | 1.050 | 0.694 | 0.685 | 0.726 |
+| B=4 C=128 L=4096 K=15 d=1 g=128 | 8.735 | 6.487 | **6.432** | 4.832 | 4.795 | 4.828 |
+| B=4 C=256 L=16000 K=3 d=8 g=256 | 12.927 | **8.989** | 9.046 | 5.210 | 5.747 | 5.992 |
+| B=1 C=256 L=16000 K=3 d=1 g=1 | 5.669 | **4.628** | 4.693 | 3.914 | 3.899 | 3.975 |
+
+**`max-autotune` ≥ `default` does not hold.** It loses to plain `default` in
+**8 of 10** measurements above, sometimes badly (`wide-kernel-dw` forward:
+0.916 vs 0.603 ms). It wins exactly once by a margin worth having — `small`
+forward+backward, 0.402 vs 0.530 ms.
+
+It is also **not reproducible**. The same five configurations were measured
+twice; `default` agreed with itself to within 12%, `max-autotune` did not:
+
+| config, forward | run A | run B | ratio |
+|---|---|---|---|
+| dc1d/ma, `medium` | 0.694 ms | 0.153 ms | **4.5×** |
+| gs/ma, `medium` | 1.262 ms | 0.154 ms | **8.2×** |
+| dc1d/ma, `wide-kernel-dw` | 0.542 ms | 0.916 ms | 1.7× |
+
+In run A, `dc1d/ma` at `medium` was **slower than eager** (0.694 vs 0.536 ms,
+i.e. 0.77×). Inductor logs
+`skipping cudagraph due to ... exceeding max re-recording limit` and
+`out of resource: triton_depthwise_conv1d` during these compilations, so the
+mode is silently falling back to different kernels between runs.
+
+And it is **expensive**. From a cold cache (fresh process, empty Inductor and
+Triton caches, `B=4 C=256 L=16000 K=3 d=8 g=256`):
+
+| backend / mode | fwd | fwd+bwd |
+|---|---|---|
+| dc1d / default | **3.1 s** | **8.5 s** |
+| dc1d / max-autotune | **212.1 s** | **224.8 s** |
+| grid_sample / default | 3.4 s | 4.1 s |
+| grid_sample / max-autotune | 207.4 s | 212.4 s |
+
+Warm — same process, same shape already in the on-disk FX-graph cache —
+`default` costs 0.16–1.2 s per (config, phase). **`max-autotune` costs
+3.5 minutes per shape to buy a result that is usually worse and never
+reproducible. Do not use it for this operator.**
+
+### 5.5 Kernel launches — settling the "~25 → ~5" claim
+
+`TODO.md` has carried "~25 kernels → ~5" for the kernel rewrite as a **static
+reading of the diff**, never a profile. Profiled here with
+`torch.profiler(activities=[CUDA])`, one warmed call, `B=4 C=64 L=4096 K=3
+d=1 g=1`:
+
+| what | fwd | fwd+bwd |
+|---|---|---|
+| `efficient_linterpolate`, pre-rewrite (`eac995f^`) | **26** | 57 |
+| `efficient_linterpolate`, current | **23** | 44 |
+| `grid_sample_linterpolate` | 14 | 23 |
+| full layer: dc1d, eager | 27 | 66 |
+| full layer: grid_sample, eager | 17 | 42 |
+| full layer: dc1d, **compiled** | **4** | 31 |
+| full layer: grid_sample, **compiled** | **4** | 28 |
+
+**The claim is half right, and the wrong half is the important one.** "~25" is
+accurate — the pre-rewrite kernel launches 26. "~5" is not: the current eager
+kernel launches **23**, a 12% reduction, not a 5×. The rewrite's win was
+memory (2.9× peak RSS, §4.5b) and correctness, not launch count.
+
+**~5 is real, but `torch.compile` is what delivers it**: 27 → 4 for the whole
+forward. That is also the mechanism behind §5.3 — the elementwise chain and
+both gathers collapse into essentially one fused kernel plus the contraction.
+Note the compiled dc1d and compiled `grid_sample` forwards launch **the same
+number of kernels (4)**, which is why their compiled latencies are within a few
+percent: after fusion they are doing the same amount of memory traffic.
+
+The backward tells the other half of the story: dc1d 66 → 31 versus
+`grid_sample` 42 → 28. dc1d's backward starts 1.6× behind and stays there.
+
+### 5.6 Shapes: every sequence length is a new compile
+
+dc1d exists for speech separation, where utterances have different lengths.
+`B=4 C=128 K=3`, five lengths in sequence, counting `unique_graphs`:
+
+| regime | graphs after 5 lengths | compile per new length | steady state at L=4096 |
+|---|---|---|---|
+| static (default) | **5** (1 per length) | 0.3 – 1.3 s | **0.255 ms** |
+| `torch.compile(dynamic=True)` | **5** (1 per length) | 0.3 – 0.5 s | 0.440 ms |
+| `maybe_mark_dynamic(length)` | **5** (1 per length) | 0.3 s | 0.529 ms |
+| `mark_dynamic(length)` | — | — | **raises** |
+
+**Dynamic shapes are not available for this kernel.** `mark_dynamic` fails
+outright with
+
+```
+ConstraintViolationError: You marked L['a'][0].size()[2] as dynamic but your
+code specialized it to be a constant (1024).
+  File "dc1d/ops.py", line 184, in efficient_linterpolate
+    x0 = torch.take_along_dim(xg, idx, dim=3).reshape(
+```
+
+and the two softer regimes do not raise only because they are permitted to
+specialise silently — which they do, recompiling once per length exactly like
+the static default, while making the steady state **1.7–2.1× slower** for the
+privilege. So the honest accounting for a variable-length workload is: pay
+~0.3 s of Inductor compile per distinct length, and keep the static speedups.
+For a job with a handful of bucketed lengths that is nothing; for one that
+sees arbitrary lengths it is a real tax, and it is a **deferred fix** — the
+specialisation is in `efficient_linterpolate`'s `reshape` to
+`out_length * kernel_size`, not something Dynamo could not handle in principle.
+
+### 5.7 Does compilation preserve exactness?
+
+This is the question that decides whether any of the above matters. dc1d's
+kernel is preferred over `grid_sample` *because* it is bit-exact against
+`nn.Conv1d`; a compiled kernel that quietly gives that up would be no better
+than `grid_sample`. Checked with `--compile-check`, on a stream of **distinct**
+inputs (four different tensors per configuration, with an assertion that
+consecutive eager outputs differ, so a one-call lag cannot pass unnoticed), and
+run **separately from any timing loop**:
+
+| check | `default` | `max-autotune` |
+|---|---|---|
+| interpolation forward vs eager, fp32 and fp64, 3 configs | **bit-exact, 12/12** | **bit-exact, 12/12** |
+| interpolation gradients vs eager | ≤ 1.8e-07 rel (fp32), ≤ 2.8e-16 (fp64) | same |
+| whole layer vs eager, fp32 | ≤ 1.0e-07 rel | ≤ 1.0e-07 rel |
+| `nn.Conv1d` invariant, fp64, zero offsets | bit-exact 2/3; **2 ulp** in the grouped config | identical |
+| `gradcheck` (input, offsets), fp64 | **PASS** | **PASS** |
+
+**The sampling is untouched.** Splitting the interpolation from the contraction
+is what makes this readable: the interpolation forward is bit-exact at every
+configuration and both dtypes, so Inductor's fusion does not move where the
+layer reads. Every residual difference is in the grouped `F.conv1d`
+contraction, which Inductor reassociates — a float32 sum reordered in the last
+ulp, and in float64 a 2-ulp (`4.4e-16`) departure from `nn.Conv1d` in the
+`groups=8` case.
+
+That 2 ulp is not nothing: `tests/test_equivalence.py` asserts **bit**-exactness,
+and under `torch.compile` with `groups > 1` it would fail as written. It is a
+reassociated sum, not a mis-indexed gather — but the test's whole value is that
+it does not accept "close enough", so this should be recorded as a documented
+limit of compiling the layer rather than papered over with a tolerance.
+
+### 5.8 Reproducibility
+
+The `default` sweep was run twice, independently, three rounds each.
+
+* **Eager columns cross-validate against §4.1**: `dc1d` agrees with the
+  eager-only table to within 3% on 11/13 forward rows, and `grid_sample` to
+  within 5% on 11/13. That is the evidence that `--triton-overrides off` really
+  did hold the dispatch regime fixed.
+* **Run-to-run**: 8/13 forward rows agree to within 4% on every column. Five do
+  not, and are marked ⚠ in §5.1/§5.2. The worst is `convtasnet-H512`, where
+  `dc1d/c` came out 2.63 ms and 5.09 ms in the two runs and `grid_sample`
+  11.59 ms and 22.76 ms — a factor of two, on the largest configuration in the
+  grid. The 3090 also drives this machine's desktop (Chrome holds a GPU
+  process), which §4 already flags.
+* The **conclusions do not depend on the noisy rows.** `dc1d/c` and
+  `grid_sample/c` are within 13% of each other on forward in *both* runs
+  including `convtasnet-H512` (2.63 vs 2.40, and 5.09 vs 4.88), and
+  `grid_sample/c` wins fwd+bwd in 13/13 in both.
+
+---
+
+## 6. Recommendation
+
+### 6.1 Should dc1d adopt a `grid_sample` backend? — **Yes, but the case is now much narrower.**
+
+> **Revised after §5.** The original recommendation rested on `grid_sample`
+> winning **13/13** configurations by 1.6–5.3× on forward. Every one of those
+> numbers was measured in eager mode. Under `torch.compile`, which the layer now
+> supports with zero graph breaks, **the forward advantage all but disappears:
+> ≤ 13%, median ~4%, and dc1d wins 3 of 13** (§5.3). The forward case for giving
+> up bit-exactness is gone. What survives is the **backward**, where
+> `grid_sample` still wins 13/13 by 4–74% even with both compiled — and the
+> no-compilation property, which matters precisely for the users who will never
+> run `torch.compile`.
+>
+> The revised recommendation, therefore:
+>
+> * **Still adopt it, still opt-in** — the eager numbers in §4 are real, and a
+>   user who cannot or will not compile gets 1.6–5.3× forward for a documented
+>   loss of exactness.
+> * **Do not present it as the fast path.** For anyone willing to call
+>   `torch.compile`, `interpolation_function=grid_sample_linterpolate` buys
+>   ~4% on forward and costs the `nn.Conv1d` invariant. Documentation should say
+>   so plainly: **compile first, and only reach for `grid_sample` if the
+>   backward is your bottleneck.**
+> * **`torch.compile` is the better first recommendation for the default
+>   kernel** — 2.3–3.9× forward and 1.2–1.9× fwd+bwd on the well-behaved
+>   configurations, with the sampling bit-exact against eager (§5.7) and
+>   `gradcheck` passing.
+
+The original eager-mode case, unchanged, is below.
+
+* **It is faster and smaller in 13/13 configurations** *in eager mode*, forward
+  and forward+backward: 1.6–5.3× faster forward, 1.4–2.6× faster fwd+bwd,
+  1.6–3.9× less forward memory, 2.3–5.2× less fwd+bwd memory. dc1d's own review
+  estimated 1.5–2×; the measured win is larger. **Compiled, the forward margin
+  falls to ≤ 13% (§5.1) and only the fwd+bwd margin survives (§5.2).**
 * **It requires no compilation.** `torch.ops.aten.grid_sampler_2d` is an ATen
   builtin — verified present, nothing is built at import or at call time. This
   was the deciding constraint and it is satisfied. **dc1d's "no C++/CUDA
@@ -529,29 +863,44 @@ The measurements support it decisively, and the deciding constraint holds:
   function of `L`, and a regression test pinning the fp32 forcing (assert the
   bf16 error stays at the normalisation floor, not the collapsed value).
 * `tests/test_gradients.py` applies unchanged and passes.
-* README/CLAUDE.md need a short "choosing a backend" note: exactness by
-  default, speed on request.
+* README/CLAUDE.md need a short "choosing a backend" note: **exactness by
+  default, `torch.compile` for speed, `grid_sample` only if the backward is the
+  bottleneck and the exactness loss is acceptable.**
 
-### 5.2 Is a fused Triton kernel worth writing? — **Not now.**
+### 6.2 Is a fused Triton kernel worth writing? — **Still no, and now for a better reason.**
 
-The comparison against torchvision's hand-written C++/CUDA kernel is the
-evidence, and it does **not** say "compiled kernels win":
+The original argument was that torchvision's hand-written C++/CUDA kernel does
+not beat pure PyTorch reliably, so a fused kernel is not obviously worth the
+build step:
 
 * torchvision is fastest in only 2/13 forward configs, and is **4–10× slower
   than pure-PyTorch dc1d** in six of them — all depthwise, which is the regime
-  dc1d exists for.
+  dc1d exists for. Compiling it changes nothing (§5.1): Inductor cannot fuse
+  into an opaque custom op.
 * `grid_sample`, an ATen builtin with no build step, beats torchvision in 10/13
   forward configs.
 
-So the achievable headroom from a *good* fused kernel is real but is mostly
-already collected by `grid_sample` at zero build cost. A Triton kernel would
-have to beat `grid_sample`'s 1.6–5.3×, would violate the no-compilation
-property, and would need to avoid the grouped-conv cliff torchvision fell into.
-Revisit only if profiling of a real training run shows the remaining gap
-matters; the two deferred items in TODO.md (fusing the two gathers, folding
-interpolation into the contraction) are cheaper places to look first.
+**§5 replaces that argument with a stronger one: Inductor already writes the
+fused kernel.** The compiled forward is **4 CUDA kernel launches**, down from 27
+(§5.5), and it lands within a few percent of `grid_sample`'s while keeping the
+sampling bit-exact. A hand-written Triton kernel would have to beat *that*, and
+it would have to be shipped as source, breaking the no-compilation property —
+whereas `torch.compile` is opt-in at the call site and costs nothing to anyone
+who does not use it.
 
-### 5.3 Should the two repos' implementations be unified? — **Yes: retire tinymera's.**
+**Where the remaining headroom actually is: the backward.** The forward
+compiles 27 → 4 launches; the backward only 66 → 31, and that is exactly where
+`grid_sample/c` still wins 13/13 (§5.2). The cheap fix is already listed in
+`TODO.md` and is not a Triton kernel: a **custom autograd `Function` for the
+interpolation**, whose backward needs only the integer index and `frac` rather
+than the stored `x0`, `x1`. Do that before considering a fused kernel.
+
+**And do not reach for `mode="max-autotune"`.** It lost to `mode="default"` in
+8 of 10 measurements, was slower than *eager* in one, varied by up to 4.5×
+between two runs of the same configuration, and costs ~3.5 minutes per shape
+from a cold cache (§5.4).
+
+### 6.3 Should the two repos' implementations be unified? — **Yes: retire tinymera's.**
 
 `tinymera.nn.DeformConv1d` / `tinymera.ops.deform_conv1d` should be replaced by
 a dependency on dc1d. Grounds, in order of severity:
