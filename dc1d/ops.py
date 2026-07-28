@@ -84,7 +84,7 @@ def _dilated_positions_long(
 #                  ``x0`` and ``x1``, so two (B, C, L_out, K) tensors are held.
 #   ``save-diff``  a custom Function that stores the single tensor the offset
 #                  gradient actually needs, ``x1 - x0``. Half the saved
-#                  footprint of ``autograd``.
+#                  footprint of ``autograd``. **Restricted** -- see below.
 #   ``recompute``  a custom Function that stores nothing but the index and the
 #                  fraction and re-gathers ``x0``/``x1`` in the backward. Lowest
 #                  saved footprint; pays two extra gathers.
@@ -95,6 +95,26 @@ def _dilated_positions_long(
 #     dL/dw    ``sum_c g * (x1 - x0)``, summed over the channels sharing an
 #              offset group; ``i`` is detached and ``dw/d(offset) == 1``, so
 #              this is also dL/d(offset) before the group reduction.
+#
+# **What a custom Function costs.** Replacing pure ATen with an
+# ``autograd.Function`` is not free in capability, and both restrictions were
+# found by testing rather than reasoning:
+#
+# *  ``vmap``/``torch.func``. A Function is opaque to functorch unless it
+#    declares ``setup_context`` and ``generate_vmap_rule``. Without them
+#    ``torch.vmap(layer)`` raises, where the pure-ATen kernel just works.
+#    ``recompute`` declares both. ``save-diff`` cannot: its saved tensor is an
+#    intermediate, not an input, and ``setup_context`` only sees inputs and
+#    outputs.
+# *  **Double backward.** ``save-diff`` stores ``x1 - x0`` as a *constant*, so
+#    ``d(dL/d offsets)/dx`` comes out zero instead of correct -- silently.
+#    ``recompute`` re-derives it from the saved input and is exact. ``save-diff``
+#    therefore raises under ``create_graph=True`` rather than returning a wrong
+#    answer.
+#
+# ``recompute`` is consequently the only one of the two that could ever be the
+# default; ``save-diff`` exists to separate the memory contribution of the saved
+# difference from that of the recomputation.
 #
 # **Determinism.** ``dL/dx`` is a scatter-add, which on CUDA accumulates with
 # atomics and is therefore *not* bitwise reproducible run to run. Measured, for
@@ -143,7 +163,14 @@ def _gather_lerp_autograd(xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:
 
 
 class _GatherLerpSaveDiff(torch.autograd.Function):
-    """Custom Function saving ``x1 - x0`` instead of both ``x0`` and ``x1``."""
+    """
+    Custom Function saving ``x1 - x0`` instead of both ``x0`` and ``x1``.
+
+    Deliberately written with the legacy ``forward(ctx, ...)`` signature: the
+    tensor it wants to save is an intermediate, and ``setup_context`` is only
+    handed the inputs and the outputs. The price is that this variant is
+    unavailable to ``vmap``/``torch.func`` and to double backward.
+    """
 
     @staticmethod
     def forward(ctx, xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:  # type: ignore[override]
@@ -166,6 +193,16 @@ class _GatherLerpSaveDiff(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):  # type: ignore[override]
+        if torch.is_grad_enabled():
+            # Only true under `create_graph=True`. The saved difference is a
+            # constant with no edge back to x, so d(dL/d offsets)/dx would come
+            # out zero. Refusing is the only honest option; use 'recompute'.
+            raise RuntimeError(
+                "the 'save-diff' gather/lerp backward does not support double backward "
+                "(create_graph=True): it saves x1 - x0 as a constant, so the second-order "
+                "term through the input would be silently zero. Use _gather_lerp='recompute' "
+                "or the default 'autograd'."
+            )
         idx, w, diff = ctx.saved_tensors
         grad_x = grad_w = None
         if ctx.needs_input_grad[0]:
@@ -176,14 +213,26 @@ class _GatherLerpSaveDiff(torch.autograd.Function):
 
 
 class _GatherLerpRecompute(torch.autograd.Function):
-    """Custom Function saving nothing but the index and the fraction."""
+    """
+    Custom Function saving nothing but the index and the fraction.
+
+    Modern ``forward``/``setup_context`` split plus ``generate_vmap_rule``, so
+    it stays usable from ``vmap`` and ``torch.func`` exactly as the pure-ATen
+    kernel is. Everything it saves is an *input*, which is also what makes its
+    double backward exact.
+    """
+
+    generate_vmap_rule = True
 
     @staticmethod
-    def forward(ctx, xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:  # type: ignore[override]
+    def forward(xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:  # type: ignore[override]
         x0, x1 = _gather_pair(xg, idx)
-        out = torch.lerp(x0, x1, w)
+        return torch.lerp(x0, x1, w)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output) -> None:  # type: ignore[override]
+        xg, idx, w = inputs
         ctx.save_for_backward(xg, idx, w)
-        return out
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):  # type: ignore[override]

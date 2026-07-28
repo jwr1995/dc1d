@@ -204,3 +204,62 @@ def test_input_gradient_scatter_is_deterministic_on_cpu(impl):
         torch.use_deterministic_algorithms(was)
     assert torch.equal(a[0], b[0])
     assert torch.equal(a[1], b[1])
+
+
+def _interp(impl):
+    n_offsets = output_length(LENGTH, KERNEL)
+
+    def fn(a, b):
+        return efficient_linterpolate(a, b, KERNEL, 1, 1, unconstrained=True, _gather_lerp=impl)
+
+    return fn, n_offsets
+
+
+@pytest.mark.parametrize("impl", ["autograd", "recompute"])
+def test_gather_lerp_variant_supports_vmap(impl):
+    """
+    A custom `autograd.Function` is opaque to functorch unless it declares
+    `setup_context` and `generate_vmap_rule`. The pure-ATen kernel needs
+    neither, so losing `vmap` would be a real capability regression.
+    """
+    torch.manual_seed(0)
+    fn, n_offsets = _interp(impl)
+    xs = torch.randn(3, BATCH, CHANNELS, LENGTH, dtype=torch.float64)
+    offs = torch.randn(3, BATCH, 1, n_offsets, KERNEL, dtype=torch.float64)
+
+    got = torch.vmap(fn)(xs, offs)
+    want = torch.stack([fn(xs[i], offs[i]) for i in range(3)])
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("impl", ["autograd", "recompute"])
+def test_gather_lerp_variant_supports_double_backward(impl):
+    """
+    `create_graph=True` (gradient penalties, Hessian-vector products) needs the
+    backward itself to be differentiable. `recompute` re-derives `x1 - x0` from
+    the saved *input*, so the second-order term through `x` survives.
+    """
+    torch.manual_seed(0)
+    fn, n_offsets = _interp(impl)
+    x = torch.randn(BATCH, CHANNELS, LENGTH, dtype=torch.float64, requires_grad=True)
+    offsets = _offsets(
+        (BATCH, 1, n_offsets, KERNEL), torch.Generator().manual_seed(7)
+    ).requires_grad_(True)
+
+    grad_x, grad_off = torch.autograd.grad(fn(x, offsets).sum(), [x, offsets], create_graph=True)
+    (second,) = torch.autograd.grad(grad_off.sum() + grad_x.sum(), [x])
+    # d(sum_i sum_c (x[i+1] - x[i]))/dx is +-1 per element, never identically 0.
+    assert second.abs().sum() > 0
+
+
+def test_save_diff_refuses_double_backward():
+    """
+    `save-diff` stores `x1 - x0` as a constant, so the second-order term through
+    the input would silently be zero. It must raise rather than answer wrongly.
+    """
+    torch.manual_seed(0)
+    fn, n_offsets = _interp("save-diff")
+    x = torch.randn(BATCH, CHANNELS, LENGTH, dtype=torch.float64, requires_grad=True)
+    offsets = torch.randn(BATCH, 1, n_offsets, KERNEL, dtype=torch.float64).requires_grad_(True)
+    with pytest.raises(RuntimeError, match="does not support double backward"):
+        torch.autograd.grad(fn(x, offsets).sum(), [x, offsets], create_graph=True)
