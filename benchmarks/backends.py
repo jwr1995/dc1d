@@ -139,6 +139,8 @@ property of the design and not a benchmarking artefact.
 from __future__ import annotations
 
 import argparse
+import copy
+import functools
 import json
 import math
 import os
@@ -1563,6 +1565,7 @@ class Variant:
     label: str
     base: str
     mode: str | None = None
+    gather_lerp: str | None = None  # dc1d only: which gather+lerp backward to use
 
     @property
     def compiled(self) -> bool:
@@ -1595,6 +1598,18 @@ AUTOTUNE_VARIANTS: list[Variant] = [
 AUTOTUNE_NAMES = ("small", "medium", "wide-kernel-dw", "speech-4x256", "speech-dense")
 AUTOTUNE_GRID: list[Config] = [c for c in GRID if c.name in AUTOTUNE_NAMES]
 
+# The custom-autograd.Function study (BACKENDS.md 5.9). `gs/c` is the target to
+# beat: it is what still wins 13/13 fwd+bwd in 5.2.
+BACKWARD_VARIANTS: list[Variant] = [
+    Variant("dc1d", "dc1d"),
+    Variant("dc1d/c", "dc1d", "default"),
+    Variant("sd", "dc1d", gather_lerp="save-diff"),
+    Variant("sd/c", "dc1d", "default", gather_lerp="save-diff"),
+    Variant("rc", "dc1d", gather_lerp="recompute"),
+    Variant("rc/c", "dc1d", "default", gather_lerp="recompute"),
+    Variant("gs/c", "grid_sample", "default"),
+]
+
 
 def _distinct_wrapper(fn, tag: str):
     """
@@ -1613,11 +1628,28 @@ def _distinct_wrapper(fn, tag: str):
     return namespace[f"_call_{tag}"]
 
 
+def _with_gather_lerp(layer: DeformConv1d, name: str | None) -> DeformConv1d:
+    """
+    A view of ``layer`` that uses a different gather+lerp backward.
+
+    ``copy.copy`` gives a module with its own ``__dict__`` but the *same*
+    parameter tensors, so every variant in a round-robin measures the same
+    weights on the same memory -- asserted below, because a silent deep copy
+    would double the layer's footprint and make the memory table wrong.
+    """
+    if name is None:
+        return layer
+    clone = copy.copy(layer)
+    clone.interpolation_function = functools.partial(efficient_linterpolate, _gather_lerp=name)
+    assert clone.weight is layer.weight, "copy.copy(DeformConv1d) did not share parameters"
+    return clone
+
+
 def _variant_callable(variant: Variant, cfg: Config, tensors: tuple):
     """Return ``(fn, args)`` for ``variant``; ``fn`` is compiled when asked."""
     x, offsets, offsets_tv, layer, vanilla = tensors
     if variant.base == "dc1d":
-        fn, args = layer, (x, offsets)
+        fn, args = _with_gather_lerp(layer, variant.gather_lerp), (x, offsets)
     elif variant.base == "grid_sample":
         fn, args = (
             grid_sample_deform_conv1d,
@@ -1767,6 +1799,317 @@ def print_compile_table(rows: list[dict], variants: list[Variant], title: str) -
         " tracing, AOTAutograd partitioning, Inductor codegen and the Triton build all\n"
         " happen. It is paid once per process per shape and is not amortised by short jobs.)"
     )
+
+
+# ---------------------------------------------------------------------------
+# The custom-autograd.Function study
+# ---------------------------------------------------------------------------
+#
+# BACKENDS.md 5.3 identified the backward as the entire remaining gap to
+# `grid_sample`: compiled, dc1d's forward lands within a few percent, but
+# `grid_sample/c` still wins forward+backward 13/13 by 4-74%. The mechanism is
+# in 5.5 -- the forward compiles 27 -> 4 kernel launches, the backward only
+# 66 -> 31.
+#
+# `dc1d/ops.py` now carries two hand-written backwards (`save-diff` and
+# `recompute`) alongside the autograd-derived one. This section measures
+# whether either closes the gap, and at what cost in memory. Latency alone is
+# the wrong figure of merit for this operator: dc1d is memory-bandwidth-bound
+# and peak memory is what caps batch size and sequence length in the
+# speech-separation regime it exists for, so peak `max_memory_allocated` is
+# reported next to every timing.
+
+
+def measure_variant_memory(
+    cfg: Config, variants: list[Variant], device: str, dtype: torch.dtype
+) -> dict:
+    """
+    Peak ``torch.cuda.max_memory_allocated`` for one call of each variant.
+
+    Protocol differs from `measure_cuda_memory` in one deliberate way: every
+    variant is warmed three times before the measured call, because a compiled
+    variant's first call *is* the compile and would otherwise be measuring
+    Inductor's scratch space. Gradients are then dropped so that the measured
+    call still pays for allocating them, as in section 4.3.
+    """
+    row: dict = {"name": cfg.name, "label": cfg.label}
+    for phase, requires_grad in (("fwd", False), ("fwd+bwd", True)):
+        for v in variants:
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+            x, offsets, offsets_tv, _tm, layer, vanilla, _ = make_inputs(
+                cfg, device, dtype, requires_grad
+            )
+            fn, args = _variant_callable(v, cfg, (x, offsets, offsets_tv, layer, vanilla))
+            try:
+                for _ in range(3):
+                    _run_once(fn, args, requires_grad, device)
+                for tensor in (x, offsets, layer.weight, layer.bias):
+                    tensor.grad = None
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
+                base = torch.cuda.memory_allocated(device)
+                _run_once(fn, args, requires_grad, device)
+                row[f"{v.label} {phase}"] = (torch.cuda.max_memory_allocated(device) - base) / 2**20
+            except Exception as exc:  # noqa: BLE001
+                print(f"    memory measurement failed for {v.label}/{phase}: {exc}")
+                row[f"{v.label} {phase}"] = float("nan")
+            del fn, args, x, offsets, offsets_tv, layer, vanilla
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+    return row
+
+
+def print_variant_memory_table(rows: list[dict], variants: list[Variant], title: str) -> None:
+    ref_label = variants[0].label
+    for phase, tag in (("fwd", "forward"), ("fwd+bwd", "forward+backward")):
+        print(f"\n### {title} -- {tag} (MiB)\n")
+        others = [v.label for v in variants[1:]]
+        header = ["config", ref_label, *others]
+        widths = [34, 9, *([17] * len(others))]
+        body = []
+        for r in rows:
+            ref = r[f"{ref_label} {phase}"]
+            cells = [r["label"], f"{ref:.1f}"]
+            for label in others:
+                m = r[f"{label} {phase}"]
+                cells.append(f"{m:.1f} ({ref / m:.2f}x)" if m == m and m > 0 else f"{m:.1f}")
+            body.append(cells)
+        _emit_table(header, widths, body)
+    print(
+        f"\n(peak torch.cuda.max_memory_allocated above a post-warmup baseline; the\n"
+        f" bracketed factor is {ref_label} / variant, so > 1x means SMALLER than eager\n"
+        f" {ref_label}.)"
+    )
+
+
+def backward_launch_counts(device: str, dtype: torch.dtype) -> None:
+    """Kernel launches for each gather+lerp variant, eager and compiled."""
+    print("\n" + "=" * 78)
+    print("CUDA KERNEL LAUNCHES -- gather+lerp backward variants")
+    print("=" * 78)
+    if not device.startswith("cuda"):
+        print("  skipped: requires a CUDA device")
+        return
+
+    cfg = Config("launch-probe", 4, 64, 4096, 3, 1, 1)
+    out_len = output_length(cfg.length, cfg.kernel_size, cfg.dilation, cfg.stride)
+    print(f"\n  config: {cfg.label}\n")
+
+    rows: list[tuple[str, str, str]] = []
+    for phase, requires_grad in (("fwd", False), ("fwd+bwd", True)):
+        x = torch.randn(
+            cfg.batch,
+            cfg.channels,
+            cfg.length,
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        offsets = torch.randn(
+            cfg.batch, cfg.offset_groups, out_len, cfg.kernel_size, device=device, dtype=dtype
+        ).requires_grad_(requires_grad)
+        layer = DeformConv1d(
+            cfg.channels, cfg.channels, cfg.kernel_size, padding="valid", unconstrained=True
+        ).to(device=device, dtype=dtype)
+
+        for impl in ("autograd", "save-diff", "recompute"):
+            variant = _with_gather_lerp(layer, impl)
+            for tag, fn in (
+                ("eager", variant),
+                (
+                    "compiled",
+                    torch.compile(
+                        _distinct_wrapper(variant, f"bl_{impl.replace('-', '_')}"),
+                        mode="default",
+                        fullgraph=True,
+                    ),
+                ),
+            ):
+                torch._dynamo.reset()
+                try:
+                    count = _count_cuda_kernels(fn, (x, offsets), requires_grad, device)
+                    rows.append((f"layer: dc1d {impl} ({tag})", phase, str(count)))
+                except Exception as exc:  # noqa: BLE001
+                    rows.append((f"layer: dc1d {impl} ({tag})", phase, f"failed ({exc})"))
+                torch._dynamo.reset()
+
+        del x, offsets, layer
+        torch.cuda.empty_cache()
+
+    names: list[str] = []
+    for name, _, _ in rows:
+        if name not in names:
+            names.append(name)
+    body = []
+    for name in names:
+        cells = [name]
+        for phase in ("fwd", "fwd+bwd"):
+            match = [v for n, p, v in rows if n == name and p == phase]
+            cells.append(match[0] if match else "-")
+        body.append(cells)
+    _emit_table(["what", "fwd", "fwd+bwd"], [44, 10, 10], body)
+
+
+def backward_determinism(device: str, dtype: torch.dtype) -> int:
+    """
+    Does the input gradient reproduce run to run, and what happens under
+    ``torch.use_deterministic_algorithms(True)``?
+
+    The input gradient is a scatter-add. On CUDA that is an atomic accumulation
+    whose summation order depends on thread scheduling, so bitwise repeatability
+    is not guaranteed for *any* of the three variants -- including the
+    autograd-derived one, whose `take_along_dim` backward is the same
+    scatter-add. This measures rather than assumes it, and records whether
+    PyTorch's deterministic mode raises, silently substitutes a deterministic
+    kernel, or does nothing.
+    """
+    print("\n" + "=" * 78)
+    print("DETERMINISM OF THE INPUT GRADIENT")
+    print("=" * 78)
+    failures = 0
+
+    torch.manual_seed(0)
+    batch, channels, length, kernel_size = 4, 64, 4096, 3
+    out_len = output_length(length, kernel_size)
+    x = torch.randn(batch, channels, length, device=device, dtype=dtype, requires_grad=True)
+    offsets = (
+        torch.randn(batch, 1, out_len, kernel_size, device=device, dtype=dtype) * 3
+    ).requires_grad_(True)
+    grad_out = torch.randn(batch, channels, out_len, kernel_size, device=device, dtype=dtype)
+
+    print(
+        f"\n  | {'variant':<10} | {'deterministic mode':<20} | {'d/dx bitwise equal':<19} "
+        f"| {'d/doffset bitwise equal':<23} | outcome"
+    )
+    print("  |" + "|".join(["-" * 12, "-" * 22, "-" * 21, "-" * 25, "-" * 30]) + "|")
+
+    was = torch.are_deterministic_algorithms_enabled()
+    for deterministic in (False, True):
+        torch.use_deterministic_algorithms(deterministic)
+        for impl in ("autograd", "save-diff", "recompute"):
+
+            def once(impl=impl):
+                out = efficient_linterpolate(
+                    x, offsets, kernel_size, 1, 1, unconstrained=True, _gather_lerp=impl
+                )
+                return torch.autograd.grad(out, [x, offsets], grad_out)
+
+            try:
+                a = once()
+                b = once()
+                same_x = bool(torch.equal(a[0], b[0]))
+                same_o = bool(torch.equal(a[1], b[1]))
+                outcome = "ran"
+            except RuntimeError as exc:
+                same_x = same_o = False
+                outcome = f"raised: {str(exc).splitlines()[0][:60]}"
+            print(
+                f"  | {impl:<10} | {str(deterministic):<20} | {str(same_x):<19} "
+                f"| {str(same_o):<23} | {outcome}"
+            )
+    torch.use_deterministic_algorithms(was)
+    return failures
+
+
+def graph_break_check(device: str, dtype: torch.dtype) -> int:
+    """
+    `torch._dynamo.explain` on every gather+lerp variant.
+
+    This is the check that decides whether the custom Function is admissible at
+    all. dc1d's best measured result is the 2.3-9.1x it gets from
+    `torch.compile`, and that depends on the layer tracing to **1 graph, 0
+    breaks**. A naively written `autograd.Function` is opaque to Dynamo and
+    would reintroduce a break, forfeiting the compile win to buy a faster eager
+    backward -- a net loss. Reported for the interpolation kernel alone and for
+    the whole layer, with `fullgraph=True` compilation as the hard assertion.
+    """
+    print("\n" + "=" * 78)
+    print("DYNAMO GRAPH BREAKS PER GATHER+LERP VARIANT")
+    print("=" * 78)
+    failures = 0
+
+    batch, channels, length, kernel_size = 2, 8, 256, 3
+    out_len = output_length(length, kernel_size)
+    x = torch.randn(batch, channels, length, device=device, dtype=dtype, requires_grad=True)
+    offsets = torch.randn(
+        batch, 1, out_len, kernel_size, device=device, dtype=dtype
+    ).requires_grad_(True)
+    layer = DeformConv1d(channels, channels, kernel_size, padding="valid", unconstrained=True).to(
+        device=device, dtype=dtype
+    )
+
+    print(f"\n  | {'variant':<10} | {'what':<14} | {'graphs':>6} | {'breaks':>6} | fullgraph |")
+    print("  |" + "|".join(["-" * 12, "-" * 16, "-" * 8, "-" * 8, "-" * 11]) + "|")
+    for impl in ("autograd", "save-diff", "recompute"):
+        variant = _with_gather_lerp(layer, impl)
+        targets = [
+            (
+                "interpolation",
+                functools.partial(
+                    efficient_linterpolate,
+                    kernel_size=kernel_size,
+                    dilation=1,
+                    stride=1,
+                    unconstrained=True,
+                    _gather_lerp=impl,
+                ),
+            ),
+            ("layer", variant),
+        ]
+        for what, fn in targets:
+            torch._dynamo.reset()
+            explained = torch._dynamo.explain(fn)(x, offsets)
+            torch._dynamo.reset()
+            try:
+                compiled = torch.compile(
+                    _distinct_wrapper(fn, f"gb_{impl.replace('-', '_')}_{what}"),
+                    mode="default",
+                    fullgraph=True,
+                )
+                y = compiled(x, offsets)
+                torch.autograd.grad(y.sum(), [x, offsets])
+                full = "PASS"
+            except Exception as exc:  # noqa: BLE001
+                full = f"FAIL ({type(exc).__name__})"
+                failures += 1
+            torch._dynamo.reset()
+            if explained.graph_break_count:
+                failures += 1
+            print(
+                f"  | {impl:<10} | {what:<14} | {explained.graph_count:6d} "
+                f"| {explained.graph_break_count:6d} | {full:<9} |"
+            )
+            for reason in explained.break_reasons:
+                print(f"      break: {reason}")
+    return failures
+
+
+def backward_study(
+    device: str,
+    dtype: torch.dtype,
+    min_run_time: float,
+    rounds: int,
+    configs: list[Config],
+) -> None:
+    """Latency + peak memory for every gather+lerp variant, plus `grid_sample/c`."""
+    rows = [
+        bench_compile_config(c, BACKWARD_VARIANTS, device, dtype, min_run_time, rounds)
+        for c in configs
+    ]
+    print_compile_table(
+        rows,
+        BACKWARD_VARIANTS,
+        f"custom autograd.Function -- {device}, {_dtype_name(dtype)}",
+    )
+    if device.startswith("cuda"):
+        mem_rows = [measure_variant_memory(c, BACKWARD_VARIANTS, device, dtype) for c in configs]
+        print_variant_memory_table(
+            mem_rows,
+            BACKWARD_VARIANTS,
+            f"Peak CUDA memory, gather+lerp variants -- {device}, {_dtype_name(dtype)}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2614,6 +2957,18 @@ def main() -> int:
         "+ launches",
     )
     parser.add_argument(
+        "--backward",
+        action="store_true",
+        help="custom autograd.Function study: graph breaks, latency, peak memory, "
+        "kernel launches and determinism for every gather+lerp variant",
+    )
+    parser.add_argument(
+        "--configs",
+        default="",
+        help="comma-separated subset of the grid to run (default: all), e.g. "
+        "'medium,speech-dense,convtasnet-H512'",
+    )
+    parser.add_argument(
         "--triton-overrides",
         default="auto",
         choices=["auto", "off", "on"],
@@ -2660,6 +3015,7 @@ def main() -> int:
         or args.compile_cold
         or args.launches
         or args.compile_all
+        or args.backward
     )
     if not (args.check or args.defects or args.bench or args.mem or compile_flags):
         args.all = True
@@ -2677,6 +3033,16 @@ def main() -> int:
     dtype = getattr(torch, args.dtype)
     environment_report(args.device, args.triton_overrides)
 
+    grid = GRID
+    if args.configs:
+        wanted = [n.strip() for n in args.configs.split(",") if n.strip()]
+        unknown = [n for n in wanted if n not in {c.name for c in GRID}]
+        if unknown:
+            print(f"unknown config name(s): {unknown}; known: {[c.name for c in GRID]}")
+            return 2
+        grid = [c for c in GRID if c.name in wanted]
+        print(f"\n(restricted to {len(grid)} of {len(GRID)} configurations: {wanted})")
+
     failures = 0
     if args.check:
         failures += check_equivalence(args.device)
@@ -2691,17 +3057,17 @@ def main() -> int:
             ]
             print_timing_table(rows, f"{title} -- {args.device}, {args.dtype}")
 
-        sweep(GRID, "Timing")
+        sweep(grid, "Timing")
         if args.sweeps:
             sweep(LENGTH_SWEEP, "Length sweep")
             sweep(CHANNEL_SWEEP, "Channel sweep")
 
     if args.mem:
         if args.device.startswith("cuda"):
-            rows = [measure_cuda_memory(c, args.device, dtype) for c in GRID]
+            rows = [measure_cuda_memory(c, args.device, dtype) for c in grid]
             print_memory_table(rows, "Peak CUDA memory", "torch.cuda.max_memory_allocated")
         else:
-            rows = [measure_cpu_memory(c, args.dtype) for c in GRID]
+            rows = [measure_cpu_memory(c, args.dtype) for c in grid]
             print_memory_table(rows, "Peak CPU memory", "RSS above post-setup baseline")
 
     if args.compile_check:
@@ -2711,7 +3077,7 @@ def main() -> int:
             bench_compile_config(
                 c, DEFAULT_VARIANTS, args.device, dtype, args.min_run_time, args.rounds
             )
-            for c in GRID
+            for c in grid
         ]
         print_compile_table(
             rows, DEFAULT_VARIANTS, f"torch.compile (default) -- {args.device}, {args.dtype}"
@@ -2721,7 +3087,7 @@ def main() -> int:
             bench_compile_config(
                 c, AUTOTUNE_VARIANTS, args.device, dtype, args.min_run_time, args.rounds
             )
-            for c in AUTOTUNE_GRID
+            for c in [x for x in AUTOTUNE_GRID if x in grid]
         ]
         print_compile_table(
             rows, AUTOTUNE_VARIANTS, f"torch.compile (max-autotune) -- {args.device}, {args.dtype}"
@@ -2732,6 +3098,11 @@ def main() -> int:
         kernel_launch_counts(args.device, dtype)
     if args.compile_cold:
         cold_compile_cost(args.device, args.dtype)
+    if args.backward:
+        failures += graph_break_check(args.device, dtype)
+        backward_launch_counts(args.device, dtype)
+        failures += backward_determinism(args.device, dtype)
+        backward_study(args.device, dtype, args.min_run_time, args.rounds, grid)
 
     return 1 if failures else 0
 
