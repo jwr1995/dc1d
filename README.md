@@ -137,10 +137,11 @@ from dc1d.nn import DeformConv1d
 from dc1d.ops import efficient_linterpolate
 
 model = DeformConv1d(
-    in_channels=512, out_channels=512, kernel_size=3, padding="same",
-    interpolation_function=functools.partial(
-        efficient_linterpolate, gather_lerp="recompute"
-    ),
+    in_channels=512,
+    out_channels=512,
+    kernel_size=3,
+    padding="same",
+    interpolation_function=functools.partial(efficient_linterpolate, gather_lerp="recompute"),
 )
 ```
 
