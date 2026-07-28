@@ -2046,12 +2046,23 @@ def _unique_graphs() -> int:
 
 def recompilation_study(device: str, dtype: torch.dtype, min_run_time: float) -> None:
     """
-    How many graphs does a compiled dc1d layer need across a run whose sequence
-    length varies, and does `mark_dynamic` on the length axis cost anything?
+    How many graphs does a compiled dc1d layer need when the sequence length
+    varies, and can dynamic shapes avoid them?
 
-    This matters because dc1d's target workload -- speech separation -- has
-    variable-length utterances. If every new length triggers a fresh Inductor
-    compile, the steady-state win is irrelevant.
+    This is the question that decides whether the compiled speedups are usable
+    at all in dc1d's target workload. Speech separation batches variable-length
+    utterances; if every new length triggers a fresh Inductor compile, a
+    steady-state win measured at one fixed shape is not a win.
+
+    Three regimes, because they can disagree:
+
+    *   **static** -- what a user gets by default;
+    *   **``dynamic=True``** -- ask Dynamo to compile a shape-polymorphic graph
+        up front;
+    *   **``mark_dynamic``** -- assert that the length axis must stay symbolic.
+        This one *raises* if the graph specialises on it anyway, which makes it
+        the only regime that can distinguish "compiled dynamically" from
+        "silently recompiled per length".
     """
     from torch._dynamo.utils import counters
 
@@ -2068,46 +2079,66 @@ def recompilation_study(device: str, dtype: torch.dtype, min_run_time: float) ->
         offsets = torch.randn(batch, 1, out_len, ksize, device=device, dtype=dtype)
         return x, offsets
 
-    for tag, dynamic in (("static (default)", False), ("mark_dynamic(length)", True)):
+    regimes = (
+        ("static (default)", {}, None),
+        ("torch.compile(dynamic=True)", {"dynamic": True}, None),
+        ("mark_dynamic(length)", {}, "mark"),
+        ("maybe_mark_dynamic(length)", {}, "maybe"),
+    )
+
+    for tag, compile_kwargs, marker in regimes:
         torch._dynamo.reset()
         counters.clear()
         layer = DeformConv1d(channels, channels, ksize, padding="valid", unconstrained=True).to(
             device=device, dtype=dtype
         )
-        compiled = torch.compile(_distinct_wrapper(layer, "shp"), fullgraph=True)
+        compiled = torch.compile(_distinct_wrapper(layer, "shp"), fullgraph=True, **compile_kwargs)
 
         print(f"\n  {tag}")
-        per_length = []
+
+        def mark(x, offsets, _marker=marker):
+            if _marker == "mark":
+                torch._dynamo.mark_dynamic(x, 2)
+                torch._dynamo.mark_dynamic(offsets, 2)
+            elif _marker == "maybe":
+                torch._dynamo.maybe_mark_dynamic(x, 2)
+                torch._dynamo.maybe_mark_dynamic(offsets, 2)
+
+        broke = False
         for length in lengths:
             before = _unique_graphs()
             x, offsets = build(length)
-            if dynamic:
-                torch._dynamo.mark_dynamic(x, 2)
-                torch._dynamo.mark_dynamic(offsets, 2)
+            mark(x, offsets)
             start = time.perf_counter()
-            compiled(x, offsets)
+            try:
+                compiled(x, offsets)
+            except Exception as exc:  # noqa: BLE001 - this outcome is the finding
+                first_line = str(exc).strip().splitlines()[0]
+                print(f"    L={length:<6} RAISED {type(exc).__name__}: {first_line[:150]}")
+                broke = True
+                break
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
             first = time.perf_counter() - start
             after = _unique_graphs()
-            per_length.append((length, after - before, first))
             print(
                 f"    L={length:<6} new graphs: {after - before}  "
                 f"first call: {first:7.2f} s  (cumulative graphs: {after})"
             )
 
-        # Steady state at one length, to price the dynamic-shape guard chain.
-        length = 4096
-        x, offsets = build(length)
-        if dynamic:
-            torch._dynamo.mark_dynamic(x, 2)
-            torch._dynamo.mark_dynamic(offsets, 2)
-        for _ in range(4):
-            compiled(x, offsets)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize(device)
-        m = _timer("fn(*args)", {"fn": compiled, "args": (x, offsets)}, "shapes", tag, min_run_time)
-        print(f"    steady state at L=4096: {m.median * 1e3:.3f} ms")
+        if not broke:
+            length = 4096
+            x, offsets = build(length)
+            mark(x, offsets)
+            for _ in range(4):
+                compiled(x, offsets)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+            m = _timer(
+                "fn(*args)", {"fn": compiled, "args": (x, offsets)}, "shapes", tag, min_run_time
+            )
+            print(f"    steady state at L=4096: {m.median * 1e3:.3f} ms")
+
         del layer, compiled
         torch._dynamo.reset()
         if device.startswith("cuda"):
@@ -2646,7 +2677,9 @@ def main() -> int:
         failures += compile_correctness(args.device)
     if args.compile:
         rows = [
-            bench_compile_config(c, DEFAULT_VARIANTS, args.device, dtype, args.min_run_time, 3)
+            bench_compile_config(
+                c, DEFAULT_VARIANTS, args.device, dtype, args.min_run_time, args.rounds
+            )
             for c in GRID
         ]
         print_compile_table(
@@ -2654,7 +2687,9 @@ def main() -> int:
         )
     if args.compile_autotune:
         rows = [
-            bench_compile_config(c, AUTOTUNE_VARIANTS, args.device, dtype, args.min_run_time, 3)
+            bench_compile_config(
+                c, AUTOTUNE_VARIANTS, args.device, dtype, args.min_run_time, args.rounds
+            )
             for c in AUTOTUNE_GRID
         ]
         print_compile_table(
