@@ -19,7 +19,10 @@ CC=<a C compiler> .venv-cuda/bin/python benchmarks/backends.py \
 > **Read §5 before acting on §6.1.** The `grid_sample` recommendation was
 > established in eager mode. Under `torch.compile` its forward advantage over
 > dc1d's own kernel falls from **1.6–5.3×** to **≤ 13%**, which changes what the
-> right default advice is.
+> right default advice is. §5.9 then removes most of what was left: a custom
+> `autograd.Function` for the backward does **not** close the latency gap, but
+> it does close the **memory** gap, which was the other half of the case for
+> `grid_sample`.
 
 **Hardware and versions** (all measured figures below come from this machine):
 
@@ -782,11 +785,317 @@ The `default` sweep was run twice, independently, three rounds each.
   including `convtasnet-H512` (2.63 vs 2.40, and 5.09 vs 4.88), and
   `grid_sample/c` wins fwd+bwd in 13/13 in both.
 
+### 5.9 A custom `autograd.Function` for the backward
+
+§5.3 named the backward as the entire remaining gap to `grid_sample` and §5.5
+gave the mechanism: the forward compiles **27 → 4** kernel launches, the
+backward only **66 → 31**. The identified fix — carried in `TODO.md` since —
+was a custom `autograd.Function`, on the grounds that autograd differentiates
+through `take_along_dim` and `lerp` and stores `x0` and `x1` where the offset
+gradient only ever needs their difference.
+
+Two variants are now in `dc1d/ops.py`, selectable with
+`efficient_linterpolate(..., gather_lerp=...)`. Both compute the identical
+forward, and `tests/test_equivalence.py` asserts it bit-for-bit across
+stride × dilation × offset_groups × constrained/unconstrained:
+
+| `gather_lerp` | what the backward keeps | `dL/dx` | `dL/d offsets` |
+|---|---|---|---|
+| `'autograd'` (default) | whatever autograd decides | `take_along_dim` backward ×2 | `lerp` backward |
+| `'save-diff'` | index, fraction, `x1 - x0` | one fused `scatter_add_` | `sum_c g·(x1-x0)` |
+| `'recompute'` | index, fraction, `x` | one fused `scatter_add_` | re-gathers, then as above |
+
+Reproduce with:
+
+```
+CC=<a C compiler> .venv-cuda/bin/python benchmarks/backends.py \
+    --backward --device cuda:0 --triton-overrides off
+```
+
+#### 5.9.1 The admissibility check: graph breaks
+
+dc1d's best measured result is the **2.3–9.1×** it gets from `torch.compile`,
+and that rests on the layer tracing to one graph with no breaks. A naively
+written `autograd.Function` is opaque to Dynamo, so a faster eager backward
+bought with a reintroduced graph break would be a net loss. Checked with
+`torch._dynamo.explain` before and after, plus a `fullgraph=True` compile with
+both gradients taken:
+
+| variant | interpolation | whole layer | `fullgraph=True` |
+|---|---|---|---|
+| `autograd` (before) | 1 graph, 0 breaks | 1 graph, 0 breaks | PASS |
+| `save-diff` | 1 graph, 0 breaks | 1 graph, 0 breaks | PASS |
+| `recompute` | 1 graph, 0 breaks | 1 graph, 0 breaks | PASS |
+
+**No `allow_in_graph` was needed.** Dynamo traces `autograd.Function.apply`
+into an `autograd_function_apply` higher-order op and inlines both the forward
+and the hand-written backward, so Inductor still sees the whole thing. That is
+also the first hint at the result below: if Inductor can see the hand-written
+backward, it can also see — and has already applied — the optimisation the
+hand-written backward was supposed to deliver.
+
+#### 5.9.2 Kernel launches — the answer, in one table
+
+`B=4 C=64 L=4096 K=3 d=1 g=1`, one warmed call, `torch.profiler`:
+
+| variant | eager fwd | eager fwd+bwd | compiled fwd | **compiled fwd+bwd** |
+|---|---|---|---|---|
+| `autograd` | 27 | 66 | 4 | **30** |
+| `save-diff` | 27 | 64 | 4 | **30** |
+| `recompute` | 27 | 69 | 4 | **30** |
+
+**The compiled backward does not move.** All three land on exactly 30 launches.
+AOTAutograd's min-cut partitioner already re-derives this schedule from the
+generic graph; writing the backward by hand tells Inductor nothing it had not
+worked out. The 66 → 31 figure §5.5 blamed for the gap is 66 → 30 here and it
+is 30 whatever the backward is written in.
+
+Eager, the hand-written backward is worth **2 launches** (66 → 64) for
+`save-diff` and costs **3** (66 → 69) for `recompute`, which pays two extra
+gathers.
+
+#### 5.9.3 Latency
+
+**Eager** (`dc1d`/`save-diff`/`recompute` only, so the round-robin is short):
+
+| | forward | forward+backward |
+|---|---|---|
+| `save-diff` vs default | 0.94 – 1.01× | **0.92 – 1.01×** |
+| `recompute` vs default | 0.85 – 1.01× | **0.77 – 0.90×** |
+
+Neither is faster. `save-diff` is a wash to 8% slower; `recompute` costs
+10–23%, which is the price of the two extra gathers. The forward differences at
+the small configurations are `autograd.Function.apply`'s dispatch overhead
+(~40 µs), visible only because those configurations are 0.3 ms.
+`convtasnet-H512` is excluded from the ranges — it read 0.5× in this sweep and
+1.0× in three others; see §5.8.
+
+**Compiled**, forward+backward (ms), minimum over three independent runs:
+
+| config | dc1d/c | sd/c | gs/c | gs/c vs dc1d/c | gs/c vs sd/c |
+|---|---|---|---|---|---|
+| B=1 C=16 L=256 K=3 d=1 g=1 | 0.414 | 0.420 | 0.444 | 0.93× | 0.95× |
+| B=4 C=64 L=1024 K=3 d=1 g=1 | 0.468 | 0.471 | 0.456 | 1.03× | 1.03× |
+| B=4 C=64 L=1024 K=3 d=1 g=64 | 0.434 | 0.439 | 0.421 | 1.03× | 1.04× |
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 0.887 | 0.791 | 0.654 | 1.36× | 1.21× |
+| B=4 C=256 L=2048 K=3 d=8 g=1 | 1.534 | 1.419 | 1.287 | 1.19× | 1.10× |
+| B=4 C=128 L=4096 K=15 d=1 g=1 ⚠ | 4.168 | 4.178 | 3.129 | 1.33× | 1.34× |
+| B=4 C=128 L=4096 K=15 d=1 g=128 | 5.895 | 5.858 | 4.799 | 1.23× | 1.22× |
+| B=4 C=128 L=4096 K=3 d=2 g=1 | 0.500 | 0.525 | 0.514 | 0.97× | 1.02× |
+| B=4 C=128 L=4096 K=3 d=1 g=1 ⚠ | 1.447 | 1.292 | 0.884 | 1.64× | 1.46× |
+| B=1 C=256 L=16000 K=3 d=1 g=256 | 1.979 | 1.833 | 1.413 | 1.40× | 1.30× |
+| B=4 C=256 L=16000 K=3 d=8 g=256 | 7.745 | 7.066 | 5.383 | 1.44× | 1.31× |
+| B=1 C=256 L=16000 K=3 d=1 g=1 | 4.462 | 4.223 | 3.913 | 1.14× | 1.08× |
+| B=8 C=512 L=8000 K=3 d=1 g=512 ⚠ | 20.544 | 22.344 | 15.828 | 1.30× | 1.41× |
+
+`sd/c` is 0.92–1.12× of `dc1d/c` — it wins by 6–12% in the five configurations
+where the tape is largest, and is a wash elsewhere. `recompute` compiled is
+indistinguishable from `save-diff` compiled, as §5.9.2 predicts.
+
+**Against the target:** `grid_sample/c` still wins forward+backward in
+**12 of 13**, and the gap only narrows:
+
+| | vs `dc1d/c` (default backward) | vs `sd/c` (custom Function) |
+|---|---|---|
+| range | 0.93 – 1.64× | 0.95 – 1.46× |
+| mean | **1.26×** | **1.19×** |
+| median | 1.23× | 1.21× |
+
+**The custom Function removes roughly a quarter of the mean gap and leaves
+three quarters.** It does not close it, and §5.9.2 says why: there was no
+launch-count headroom left to take.
+
+> **Protocol note.** These are measured with a **reversed round-robin on
+> alternate rounds**, added to `bench_compile_config` for this section. Plain
+> round-robin controls for drift *between* rounds but not *within* one: with
+> seven variants and a card that heats over a ~10 s round, whatever is measured
+> last is penalised in every round, and min-across-rounds cannot remove a bias
+> that is present in every round. The first sweeps showed the later columns
+> degrading together on exactly the configurations whose spread was worst,
+> which is a position effect and not a property of the variants. The three runs
+> tabulated above agree with each other to within 5% on 11/13 rows; the three
+> marked ⚠ do not, and `convtasnet-H512` remains the worst, exactly as §5.8
+> found.
+
+#### 5.9.4 Memory — where the Function actually pays
+
+Latency is not the figure of merit for this operator. dc1d is
+memory-bandwidth-bound and peak memory is what caps batch size and sequence
+length in the speech-separation regime it exists for. The quantity that
+differs is what is **held between the forward and the backward**, and it can be
+read directly rather than inferred from a peak:
+
+| config (output size) | `autograd` | `save-diff` | `recompute` |
+|---|---|---|---|
+| `B=4 C=64 L=1024 K=3 d=1 g=1`, og=1 (3.0 MiB) | 21.0 MiB = **7.02× out** | 6.2 MiB = 2.05× | 3.2 MiB = **1.05×** |
+| `B=4 C=256 L=2048 K=3 d=8 g=256`, og=256 (23.8 MiB) | 203.8 MiB = 8.56× | 132.0 MiB = 5.54× | 107.8 MiB = 4.53× |
+| `B=4 C=128 L=4096 K=15 d=1 g=1`, og=1 (119.6 MiB) | 841.4 MiB = **7.04× out** | 243.3 MiB = 2.03× | 122.9 MiB = **1.03×** |
+
+The 7.02× decomposes exactly: the output, `x0`, `x1`, **and two full-size int64
+indices**. `take_along_dim` broadcasts its index for the forward, but its
+*backward* saves that broadcast index materialised — 8 bytes per output element,
+twice, i.e. 4× the fp32 output. That is the same "`gather` does not broadcast"
+allocation `CLAUDE.md` warns about, reappearing on the backward side where the
+forward rewrite never looked. The custom Function keeps the compact
+`(B, G, 1, L_out·K)` index instead, which is why `recompute` holds essentially
+nothing beyond the output it must return.
+
+The `og=256` row is the exception and it is instructive: with one offset group
+per channel the "compact" index is no longer compact (2× the output in int64,
+plus the fraction at 1×), so the saving is 8.56× → 4.53× rather than → 1.03×.
+The index compaction pays in proportion to `channels / offset_groups`.
+
+Peak `max_memory_allocated` for one forward+backward, which is what a user
+actually hits (MiB; bracketed factor is eager-`dc1d` / variant, so > 1× is
+smaller). **These figures are bit-identical across four independent runs** —
+the allocator is deterministic, unlike the timings:
+
+| config | dc1d | dc1d/c | sd | sd/c | rc | rc/c | gs/c |
+|---|---|---|---|---|---|---|---|
+| B=1 C=16 L=256 K=3 d=1 g=1 | 0.6 | 0.3 | 0.3 | 0.2 | 0.3 | 0.2 | 0.1 |
+| B=4 C=64 L=1024 K=3 d=1 g=1 | 35.1 | 25.3 | 20.4 (1.72×) | 13.3 (2.63×) | 18.4 (1.91×) | 13.3 | 12.4 |
+| B=4 C=64 L=1024 K=3 d=1 g=64 | 35.0 | 21.0 | 20.3 (1.72×) | 11.3 (3.11×) | 18.3 (1.91×) | 11.3 | 8.1 |
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 280.1 | 167.9 | 160.6 (1.74×) | 88.5 (3.17×) | 144.6 (1.94×) | 88.5 | 72.1 |
+| B=4 C=256 L=2048 K=3 d=8 g=1 | 280.3 | 203.2 | 161.4 (1.74×) | 107.2 (2.61×) | 145.0 (1.93×) | 107.2 | **107.4** |
+| B=4 C=128 L=4096 K=15 d=1 g=1 | 1337.1 | 877.2 | 744.2 (1.80×) | 397.2 (3.37×) | 631.8 (2.12×) | 397.2 | **398.9** |
+| B=4 C=128 L=4096 K=15 d=1 g=128 | 1337.4 | 744.4 | 743.3 (1.80×) | 381.1 (3.51×) | 630.8 (2.12×) | 381.1 | 266.1 |
+| B=4 C=128 L=4096 K=3 d=2 g=1 | 76.2 | 60.5 | 46.5 (1.64×) | 36.5 (2.09×) | 48.5 (1.57×) | 36.5 | **36.6** |
+| B=4 C=128 L=4096 K=3 d=1 g=1 | 282.4 | 206.7 | 171.4 (1.65×) | 110.7 (2.55×) | 155.4 (1.82×) | 110.7 | **111.5** |
+| B=1 C=256 L=16000 K=3 d=1 g=256 | 548.4 | 329.8 | 315.1 (1.74×) | 173.9 (3.15×) | 283.2 (1.94×) | 173.9 | 142.1 |
+| B=4 C=256 L=16000 K=3 d=8 g=256 | 2191.3 | 1313.0 | 1255.8 (1.74×) | 691.6 (3.17×) | 1130.2 (1.94×) | 691.6 | 564.8 |
+| B=1 C=256 L=16000 K=3 d=1 g=1 | 549.1 | 394.2 | 315.5 (1.74×) | 206.2 (2.66×) | 284.0 (1.93×) | 206.2 | **206.5** |
+| B=8 C=512 L=8000 K=3 d=1 g=512 | 5938.6 | 3314.7 | 5937.7 (1.00×) | 3939.7 (1.51×) | 5688.6 (1.04×) | 3939.7 | 2249.9 |
+
+* **Eager: 1.6–1.8× (`save-diff`) and 1.6–2.1× (`recompute`) lower peak**, in
+  12 of 13 configurations.
+* **Compiled: 1.3–1.9× lower** than `dc1d/c`, which is the surprise —
+  AOTAutograd's partitioner is *not* already doing this, even though §5.9.2
+  shows it emitting the same number of kernels either way.
+* **Against `grid_sample/c` the memory gap essentially closes**: `sd/c`/`rc/c`
+  reach parity in **5 of 13** (bolded above — within 1%) and are within 20% in
+  four more. Compare `dc1d/c`, which uses **1.5–2.8×** more memory than
+  `grid_sample/c` everywhere.
+* The exception is `convtasnet-H512`, where the peak is set by a forward
+  transient (5188 MiB of the 5939 MiB peak is reached before the backward
+  starts), so shrinking the tape is invisible to the high-water mark.
+
+#### 5.9.5 What a custom Function costs
+
+Both restrictions below were found by writing a test, not by reasoning, and
+both are the kind of thing that would have shipped silently:
+
+* **`vmap` / `torch.func`.** An `autograd.Function` is opaque to functorch
+  unless it declares `setup_context` **and** `generate_vmap_rule`. Without
+  them `torch.vmap(layer)` raises, where the pure-ATen kernel simply works.
+  `recompute` declares both and is verified against a manual `stack` of
+  per-sample calls. `save-diff` structurally cannot: `setup_context` is handed
+  only the inputs and the outputs, and the tensor it wants to save is an
+  intermediate.
+* **Double backward.** `save-diff` stores `x1 - x0` as a *constant*, so under
+  `create_graph=True` the second-order term `d(dL/d offsets)/dx` comes out
+  **zero instead of correct** — silently. `recompute` re-derives it from the
+  saved input and is exact. `save-diff` therefore raises rather than answering
+  wrongly.
+
+`recompute` is consequently the only one of the two that could ever be a
+default. `save-diff` earns its place as a measurement, separating the cost of
+the saved difference from the cost of the recomputation, and is documented as
+such.
+
+#### 5.9.6 Correctness and determinism
+
+| check | result |
+|---|---|
+| forward vs default, bit-exact, 18 configurations × both variants | **`torch.equal`, 36/36** |
+| `gradcheck` float64, input **and** offsets, constrained + unconstrained, og ∈ {1,2,4} | **PASS, 18/18** (3 variants × 6) |
+| both gradients vs the default backward, float64 | ≤ 1e-12 |
+| `tests/test_equivalence.py` (`nn.Conv1d` invariant) | **unchanged and green** |
+| `torch.vmap` parity | PASS (`autograd`, `recompute`) |
+| double backward non-zero | PASS (`autograd`, `recompute`) |
+
+**Determinism.** `dL/dx` is a scatter-add. On CUDA it accumulates with atomics,
+so it is not bitwise reproducible run to run — measured, and true of **all
+three variants including the existing one**, because `take_along_dim`'s
+backward is the same scatter-add. `dL/d offsets` is a plain reduction and is
+reproducible. Under `torch.use_deterministic_algorithms(True)` PyTorch
+substitutes a deterministic `scatter_add_` rather than raising, and all three
+become bitwise reproducible:
+
+| variant | default mode | `use_deterministic_algorithms(True)` |
+|---|---|---|
+| `autograd` | `dL/dx` differs, `dL/d offsets` equal | both bitwise equal, no error |
+| `save-diff` | `dL/dx` differs, `dL/d offsets` equal | both bitwise equal, no error |
+| `recompute` | `dL/dx` differs, `dL/d offsets` equal | both bitwise equal, no error |
+
+So the custom Function introduces no determinism regression, and no
+`deterministic=` opt-out is needed.
+
+#### 5.9.7 Verdict
+
+**The custom `autograd.Function` does not close the latency gap to
+`grid_sample`, because there was no launch-count headroom left to take** —
+Inductor already partitions the generic graph into the same 30-kernel backward
+it produces from the hand-written one, and eager the hand-written backward is a
+wash (`save-diff`) or 10–23% slower (`recompute`).
+
+**It does close the memory gap, which is arguably the more useful half.** It
+takes the tape from 7.0× the output tensor to 1.03×, cuts peak forward+backward
+memory 1.6–2.1× eager and 1.3–1.9× compiled, and brings `dc1d` to parity with
+`grid_sample` on memory in 5 of 13 configurations where it was previously
+1.5–2.8× worse.
+
+Therefore: **shipped as an opt-in, not adopted as the default.** The default
+stays `'autograd'` because `'recompute'` — the only variant safe to make a
+default, per §5.9.5 — costs 10–23% of eager forward+backward, and most users of
+this package do not compile. Under `torch.compile` it is strictly better
+(0–12% faster *and* 1.3–1.9× smaller) and should be the recommendation.
+
+#### 5.9.8 Idle-GPU spot check of §5.1/§5.2
+
+Some of §5's numbers were taken while an unrelated job held `cuda:0`. Four
+configurations re-measured with both cards quiet, same flags:
+
+| config, fwd+bwd (ms) | §5.2 dc1d/c | now | §5.2 gs/c | now |
+|---|---|---|---|---|
+| B=4 C=256 L=2048 K=3 d=8 g=256 | 0.996 | 0.897 | 0.647 | 0.661 |
+| B=4 C=128 L=4096 K=15 d=1 g=128 | 6.459 | 5.901 | 4.767 | 4.805 |
+| B=1 C=256 L=16000 K=3 d=1 g=1 | 4.627 | 4.627 | 3.911 | 4.026 |
+| B=8 C=512 L=8000 K=3 d=1 g=512 ⚠ | 20.923 | 31.826 | 15.758 | 25.032 |
+
+**Three of the four reproduce to within 10% and the ordering is unchanged in
+all four**, so §5.1/§5.2 stand as written and are not re-run. The exception is
+`convtasnet-H512`, which came out **1.5–1.6× slower on the idle card** — the
+opposite of what contention would predict, and the same row §5.8 already
+flagged as 2× apart between two runs. Its spread is intrinsic to the
+configuration (5 GiB peak, power/clock limited), not an artefact of a busy GPU;
+it should keep its ⚠ and should not carry any conclusion.
+
 ---
 
 ## 6. Recommendation
 
 ### 6.1 Should dc1d adopt a `grid_sample` backend? — **Yes, but the case is now much narrower.**
+
+> **Revised again after §5.9.** `grid_sample`'s surviving case rested on two
+> things: it was faster forward+backward under compilation, and it used
+> 1.5–2.8× less memory. **The memory half is gone.** With
+> `gather_lerp='recompute'`, compiled dc1d reaches memory parity with
+> `grid_sample/c` in 5 of 13 configurations and comes within 20% in four more,
+> while keeping the `nn.Conv1d` bit-exactness invariant that `grid_sample`
+> cannot have. The latency half survives, reduced: `grid_sample/c` still wins
+> forward+backward 12/13, but by a mean of **19%** rather than 26% (§5.9.3).
+>
+> So the recommendation narrows once more:
+>
+> * **`torch.compile` + `gather_lerp='recompute'` is now the default advice**
+>   for anyone who can compile. It is 0–12% faster and 1.3–1.9× smaller than
+>   compiled dc1d with the stock backward, keeps the sampling bit-exact, and
+>   supports `vmap` and double backward.
+> * **`grid_sample` is now only for the case where forward+backward *latency*
+>   is the bottleneck** and the exactness loss is acceptable — a mean 19%, not
+>   the 1.4–2.6× the eager §4 numbers suggest.
+> * If you will not compile, `grid_sample` still buys 1.6–5.3× on the forward,
+>   and that case is unchanged.
 
 > **Revised after §5.** The original recommendation rested on `grid_sample`
 > winning **13/13** configurations by 1.6–5.3× on forward. Every one of those
@@ -888,12 +1197,22 @@ it would have to be shipped as source, breaking the no-compilation property —
 whereas `torch.compile` is opt-in at the call site and costs nothing to anyone
 who does not use it.
 
-**Where the remaining headroom actually is: the backward.** The forward
-compiles 27 → 4 launches; the backward only 66 → 31, and that is exactly where
-`grid_sample/c` still wins 13/13 (§5.2). The cheap fix is already listed in
-`TODO.md` and is not a Triton kernel: a **custom autograd `Function` for the
-interpolation**, whose backward needs only the integer index and `frac` rather
-than the stored `x0`, `x1`. Do that before considering a fused kernel.
+**Where the remaining headroom actually is: the backward — and it has now been
+tried.** §5.9 wrote the custom autograd `Function` this section recommended.
+It does **not** close the latency gap: the compiled backward launches **30**
+kernels whether the backward is hand-written or derived by autograd, because
+AOTAutograd's partitioner already reaches that schedule from the generic graph.
+Eager it is a wash or slower. What it does buy is memory — the tape drops from
+**7.0× the output tensor to 1.03×** — which closes most of `grid_sample`'s
+*memory* advantage but none of its latency advantage.
+
+**That strengthens the case against Triton rather than weakening it.** The
+cheap software fix has been applied and the remaining gap survived it, so what
+is left is genuinely kernel-level. But a hand-written kernel would now have to
+beat a compiled backward that is already at 30 launches and holding almost
+nothing, would ship as source, and would break the no-compilation property —
+for a mean 19% on forward+backward, in an operator whose users can get the
+memory win for free with one keyword.
 
 **And do not reach for `mode="max-autotune"`.** It lost to `mode="default"` in
 8 of 10 measurements, was slower than *eager* in one, varied by up to 4.5×
