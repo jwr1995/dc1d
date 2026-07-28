@@ -2,6 +2,8 @@
 
 A 1D implementation of a deformable convolutional layer implemented in pure Python in PyTorch. The code style is designed to imitate similar classes in PyTorch such as `torch.nn.Conv1d` and `torchvision.ops.DeformConv2d`.
 
+**See it working:** [`docs/demo.ipynb`](docs/demo.ipynb) is a short, plotted walkthrough of what the layer does and why it is correct. It runs in under ten seconds on a laptop CPU and is committed with its outputs, so it renders without executing anything.
+
 The motivation for creating this toolkit is that (as of 19/10/2022) there is no native 1D implementation of deformable convolution in the PyTorch library, and no alternative library which is simple to install (requiring only a basic PyTorch installation, with no additional compilation of C++ or CUDA libraries). The implementation here is written entirely in Python and makes use of `torch.autograd` for backpropagation.
 
 ## Requirements
@@ -163,6 +165,21 @@ The benchmarks use `torch.utils.benchmark.Timer`, which warms up both paths
 equally and synchronises CUDA around the timed region. Timings printed by
 earlier versions of this repo (a bare `time.time()` around an async CUDA launch,
 with warmup for the deformable path only) were not meaningful.
+
+### Demo notebook
+
+`docs/demo.ipynb` demonstrates, on tensors small enough to plot, that zero offsets
+reproduce `nn.Conv1d` exactly, that an integer offset is an exact shift, that a
+fractional offset interpolates linearly, that the offset gradient matches a finite
+difference, that sampling positions survive float16, and that the offsets train. Every
+exact property is asserted, so executing the notebook is itself a test. Figures are also
+written to `docs/demo/`.
+
+```
+uv sync --group demo
+uv run --group demo jupyter lab docs/demo.ipynb
+uv run --group demo jupyter nbconvert --to notebook --execute --inplace docs/demo.ipynb
+```
 
 ## Papers
 

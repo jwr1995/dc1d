@@ -34,6 +34,7 @@ Before pushing: `uv run ruff check && uv run ruff format --check && uv run pytes
 - `dc1d/nn.py`: `DeformConv1d` (caller supplies offsets) and `PackedDeformConv1d` (predicts offsets internally via depthwise, gLN, PReLU, pointwise, gLN, PReLU).
 - `tests/`: see below; these are load-bearing.
 - `benchmarks/benchmark.py`: `torch.utils.benchmark.Timer`, forward and forward+backward timed separately.
+- `docs/demo.ipynb`: the visual walkthrough, committed **with outputs** so it renders on GitHub, plus `docs/demo/*.png` which the notebook writes itself. Every property it shows is `assert`ed, so it is documentation and a slow test at once. It needs the `demo` dependency group, is CPU-only, and must stay under ten seconds. After any change that alters its numbers or figures, re-run `uv run --group demo jupyter nbconvert --to notebook --execute --inplace docs/demo.ipynb` and commit the regenerated outputs and PNGs. Ruff lints and formats notebook cells, so run `uv run ruff format docs/demo.ipynb` before re-executing, not after.
 - `TODO.md`: tracks outstanding work. Keep it current; tick items as they land and leave unticked items annotated with what remains.
 
 ## The invariant that matters
