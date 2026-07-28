@@ -2,9 +2,14 @@
 Equivalence tests: with zero offsets a deformable convolution *is* an ordinary
 convolution, so `DeformConv1d` must reproduce `nn.Conv1d` bit-for-bit.
 
-This is the test whose absence let the stride/dilation and offset-group bugs
-survive for three years -- it pins down indexing, dilation, stride, groups and
-the output contraction all at once.
+This is the load-bearing test: it pins down indexing, dilation, stride, groups
+and the output contraction all at once, which is what makes changes to
+`efficient_linterpolate` safe to attempt.
+
+It is *not* what would have caught the historical stride/dilation bug. The
+pre-fix `DeformConv1d` passed zero-offset equivalence at every stride, dilation
+and groups combination tried; that bug lived in `PackedDeformConv1d`'s offset
+conv, and the guard for it is the shape-contract test in `test_shapes.py`.
 """
 
 import pytest

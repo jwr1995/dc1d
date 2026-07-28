@@ -79,6 +79,16 @@ jobs:
 
       # Install the built wheel into a clean env and import it, so a missing
       # runtime dependency (dc1d shipped with none until 2026) fails the build.
+      # torch resolves to the CPU build because PEP 440 sorts the local version
+      # `2.13.0+cpu` above plain `2.13.0`, so `unsafe-best-match` prefers the
+      # pytorch index. That holds only while both indexes carry the same base
+      # version: once PyPI ships a newer one, the plain CUDA wheel would win and
+      # silently pull ~2.5 GB of nvidia-* packages. The assertion below turns
+      # that into a loud failure rather than a slow, mysterious job.
+      #
+      # Do NOT "fix" this by making the pytorch index primary. Measured: with
+      # `--index-url <pytorch-cpu> --extra-index-url <pypi>` the resolver pulls
+      # nvidia-cublas, nvidia-cudnn, nvidia-cufft and the rest. It is worse.
       - name: Import from built wheel
         run: |
           uv venv /tmp/wheeltest
@@ -87,6 +97,15 @@ jobs:
             --extra-index-url https://download.pytorch.org/whl/cpu \
             dist/*.whl
           /tmp/wheeltest/bin/python -c "import dc1d; print(dc1d.__version__); import torch; print(torch.__version__)"
+          /tmp/wheeltest/bin/python -c "
+          import torch, sys
+          v = torch.__version__
+          if '+cpu' not in v:
+              sys.exit(f'expected a CPU torch build in CI, resolved {v!r}. '
+                       'The pytorch CPU index has probably fallen behind PyPI; '
+                       'pin torch explicitly rather than reordering the indexes.')
+          print(f'CPU build confirmed: {v}')
+          "
 
       - uses: actions/upload-artifact@v4
         with:
