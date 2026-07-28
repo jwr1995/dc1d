@@ -77,20 +77,32 @@ PackedDeformConv1d`. The only instantiation is in
 
 ```python
 self.depthwise_conv = PackedDeformConv1d(
-    in_channels=in_channels,   # 512  (H from the yaml)
-    out_channels=in_channels,  # 512
-    kernel_size=kernel_size,   # 3    (P)
-    stride=stride,             # 1
-    dilation=dilation,         # 2**x for x in 0..7, so 1, 2, 4, ..., 128
-    padding=padding,           # "same"
-    groups=in_channels,        # 512
-    bias=bias,                 # True
+    in_channels=in_channels,
+    out_channels=in_channels,
+    kernel_size=kernel_size,
+    stride=stride,
+    dilation=dilation,
+    padding=padding,
+    groups=in_channels,
+    bias=bias,
 )
 ```
 
-Not passed, therefore defaulted: `offset_groups=1`, `padding_mode="reflect"`,
-`unconstrained=None` (treated as `False`, i.e. constrained), and
-`interpolation_function=efficient_linterpolate`.
+Resolved against `hparams/deformable/dtcn-whamr.yaml`:
+
+| argument | value | source |
+|---|---|---|
+| `in_channels`, `out_channels` | 512 | `H` |
+| `kernel_size` | 3 | `P` |
+| `stride` | 1 | hardcoded in `DeformableTemporalBlocksSequential` |
+| `dilation` | 1, 2, 4, ..., 128 | `2 ** x` for `x` in `range(X)`, `X = 8` |
+| `padding` | `"same"` | hardcoded |
+| `groups` | 512 | depthwise |
+| `bias` | True | |
+| `offset_groups` | 1 | not passed, dc1d default |
+| `padding_mode` | `"reflect"` | not passed, dc1d default |
+| `unconstrained` | `None`, treated as False (constrained) | not passed, dc1d default |
+| `interpolation_function` | `efficient_linterpolate` | not passed, dc1d default |
 
 `hparams/deformable/dtcn-whamr.yaml` gives `X=8`, `R=3`, so there are 24 such layers,
 three repeats of dilations 1 through 128. The encoder is `kernel_size=16`,
@@ -453,10 +465,12 @@ Per layer, the pattern is unambiguous:
 | ... | ... | False | 4.02 to 7.52 | |
 | temporalblock_2_7 | 128 | False | 4.35 | 4.00 |
 
-The first layer, the only one reached before any divergence and the only one with
-`dilation=1`, agrees **bit for bit**. Every layer after it diverges by an amount
-comparable to the full scale of the offsets themselves, including the later
-`dilation=1` layers, which diverge only because their input already has.
+The first layer is the only one that still sees an identical input when it runs, and it
+is also a `dilation=1` layer, so the two versions wire its `offset_dconv` identically:
+its offsets agree **bit for bit**. Divergence begins at the first `dilation=2` layer and
+never recovers. Every later layer differs by an amount comparable to the full scale of
+the offsets themselves, the later `dilation=1` layers included, those only because their
+input has already diverged.
 
 ### D2. Isolating the cause
 
