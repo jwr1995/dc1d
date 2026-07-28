@@ -88,6 +88,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
+"verification/*" = ["E501"]  # wide result tables read better unwrapped
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
