@@ -162,7 +162,7 @@ fixed. Findings that differ from the original review notes are called out.
 
 ## Tests
 
-There were **zero** tests. `tests/` now holds **305 passing / 72 skipped**
+There were **zero** tests. `tests/` now holds **370 passing / 72 skipped**
 (the skips are all `padding='same'` × `stride>1`, which is undefined).
 
 - [x] **1. Zero-offset equivalence** — `tests/test_equivalence.py:27`
@@ -206,6 +206,16 @@ There were **zero** tests. `tests/` now holds **305 passing / 72 skipped**
       `test_legacy_kernels_agree_and_are_differentiable`
       (`tests/test_equivalence.py:217`), which covers the two legacy interpolation
       kernels that are still exported.
+- [x] **6. Gather/lerp backward variants** — added with the custom
+      `autograd.Function` work (`BACKENDS.md` §5.9). `tests/test_equivalence.py`
+      asserts the forward is `torch.equal` to the default across
+      stride × dilation × offset_groups × constrained (18 configurations × 2
+      variants); `tests/test_gradients.py` runs `gradcheck` for all three
+      variants, compares both gradients against the default at 1e-12, asserts
+      `vmap` parity and a non-zero second-order term for the two variants that
+      support them, asserts `save-diff` *raises* under `create_graph=True`
+      instead of returning a silently-zero second-order term, and pins CPU
+      determinism under `torch.use_deterministic_algorithms(True)`.
 - [ ] **CUDA tests — not written.** Only a CPU-only torch is installed here, so a
       GPU test would be dead code that has never executed. **Left:** add a
       `@pytest.mark.skipif(not torch.cuda.is_available())` module that runs the
@@ -266,30 +276,198 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
 - [x] `torch.max(dilated_positions)` (old `ops.py:206`), a device reduction, replaced
       with the Python constant `dilation * (kernel_size - 1)` (`dc1d/ops.py:128`).
 - [x] `L >= 2` guarded (`dc1d/ops.py:110`).
-- [ ] **GPU speedup and kernel-launch counts are NOT measured.** Only CPU-only torch
-      is installed. The review's "~25 kernels → ~5" and "4–8× / ~10× memory" figures
-      are **estimates that this pass did not confirm**; the numbers reported above
-      are CPU wall-clock and CPU RSS, and the op-count reduction is a static reading
-      of the code, not a profile. **Left:** run `benchmarks/benchmark.py --device cuda`
-      on the 3090 and, for launch counts, `torch.profiler` with
-      `activities=[CUDA]` or `nsys`.
+- [x] **CPU RSS reduction re-verified** on `bench/vs-torchvision`: pre-rewrite
+      `291.0 MiB` → current `99.8 MiB` = **2.92×** at `B=4 C=256 L=2048 K=3 d=8`
+      (TODO recorded 283 → 91 = 3.1×; agreement within RSS run-to-run variation).
+      *Note:* the rewrite is in `eac995f`, **not** `50a9bed` — the latter's message
+      claims the rewrite but it only touches `benchmarks/benchmark.py`.
+- [ ] **GPU speedup for the dc1d-old-vs-dc1d-new comparison is still NOT measured.
+      Kernel-launch counts now ARE** (`BACKENDS.md` §5.5), and the review's
+      **"~25 kernels → ~5" is half wrong**. Profiled with
+      `torch.profiler(activities=[CUDA])` at `B=4 C=64 L=4096 K=3 d=1 g=1`,
+      one warmed call:
+
+      | | fwd | fwd+bwd |
+      |---|---|---|
+      | `efficient_linterpolate` pre-rewrite (`eac995f^`) | **26** | 57 |
+      | `efficient_linterpolate` current | **23** | 44 |
+      | full layer, eager | 27 | 66 |
+      | full layer, `torch.compile` | **4** | 31 |
+
+      "~25" is accurate; "~5" is not — the eager rewrite went 26 → 23, a 12%
+      reduction, not 5×. Its real win was memory (2.9× peak RSS) and
+      correctness. **`torch.compile` is what delivers ~5**: 27 → 4 on the
+      forward. Do not quote "~25 → ~5" for the rewrite; quote it for
+      compilation. The "4–8× / ~10× memory" figures remain **estimates**.
+      **Left:** `benchmarks/benchmark.py --device cuda` for old-vs-new latency.
+- [x] **`torch.compile` benchmarked end-to-end** (`BACKENDS.md` §5). Reachable
+      only because `forward` no longer mutates `self.device`; every measurement
+      ran with `fullgraph=True`. On the RTX 3090, `mode="default"`:
+      **2.3–9.1× forward, 1.2–2.1× fwd+bwd** over eager dc1d, and it takes the
+      forward from 27 CUDA kernel launches to 4. The sampling stays **bit-exact
+      against eager** (interpolation forward, fp32 and fp64, 12/12 configs) and
+      `gradcheck` passes in float64 (§5.7).
+      *Caveats, all measured:* (a) the grouped `F.conv1d` is reassociated, so
+      the `nn.Conv1d` invariant loses **2 ulp of float64** at `groups=8` —
+      `tests/test_equivalence.py` would fail as written under compilation with
+      `groups > 1`; (b) cold-cache compile is **3.1 s forward / 8.5 s fwd+bwd**;
+      (c) every distinct sequence length is a fresh ~0.3 s compile — see the
+      dynamic-shapes item below.
+- [x] **`mode="max-autotune"` benchmarked — and rejected** (`BACKENDS.md` §5.4).
+      Worse than `mode="default"` in **8 of 10** measurements, *slower than
+      eager* in one (`medium` forward, 0.77×), reproducible only to within
+      **4.5×** between two runs of the same configuration, and **~3.5 minutes
+      per shape** from a cold cache (212 s forward, 225 s fwd+bwd) against
+      `default`'s 3.1 s. Inductor logs `out of resource: triton_depthwise_conv1d`
+      and `skipping cudagraph due to ... max re-recording limit` during those
+      compilations, so it silently falls back to different kernels between runs.
+      **Do not use it for this operator.**
+- [ ] **Dynamic shapes are unavailable for this kernel** (`BACKENDS.md` §5.6).
+      `torch._dynamo.mark_dynamic` on the length axis raises
+      `ConstraintViolationError` — the graph specialises on `L` at
+      `dc1d/ops.py:184` (`take_along_dim(...).reshape(...)`). `dynamic=True` and
+      `maybe_mark_dynamic` do not raise only because they may specialise
+      silently, which they do: **one new graph per length in all three
+      regimes**, plus a **1.7–2.1× slower steady state** for asking. For a
+      variable-length workload (i.e. speech separation, what this package is
+      for) that is ~0.3 s of Inductor compile per distinct length.
+      **Left:** find and remove the specialisation so the length axis can stay
+      symbolic; the `out_length * kernel_size` reshape is the first suspect.
+- [x] **A custom autograd `Function` for the interpolation — done, and the answer is
+      "no, it does not close the latency gap"** (`BACKENDS.md` §5.9). Two variants
+      live in `dc1d/ops.py`, selected with
+      `efficient_linterpolate(..., gather_lerp='save-diff' | 'recompute')`.
+      **Default unchanged (`'autograd'`).**
+
+      *Latency: the hypothesis was wrong, and the one-table reason is kernel
+      launches.* The compiled backward is **30** launches for all three variants.
+      AOTAutograd's min-cut partitioner already re-derives that schedule from the
+      generic graph, so writing the backward by hand tells Inductor nothing new.
+      Eager, the hand-written backward is worth 2 launches (66 → 64, `save-diff`)
+      or costs 3 (66 → 69, `recompute`). Measured eager fwd+bwd: `save-diff`
+      0.92–1.01×, `recompute` 0.77–0.90×. Compiled, `sd/c` is 0.92–1.12× of
+      `dc1d/c`. `grid_sample/c` still wins fwd+bwd **12/13**, mean gap
+      **1.26× → 1.19×** — about a quarter of it removed.
+
+      *Memory: this is what it actually buys, and it is large.* The autograd tape
+      holds **7.02× the output tensor**; the custom Function holds **1.03×**. The
+      7× decomposes as output + `x0` + `x1` + **two full-size int64 indices** —
+      `take_along_dim` broadcasts its index in the forward but its *backward*
+      saves the broadcast index materialised, 4× the fp32 output between the two
+      gathers. That is the `gather`-does-not-broadcast allocation `CLAUDE.md`
+      already warns about, reappearing on the backward side where the 2022 forward
+      rewrite never looked. Peak fwd+bwd memory: **1.6–2.1× lower eager,
+      1.3–1.9× lower compiled**, and compiled dc1d reaches **memory parity with
+      `grid_sample/c` in 5 of 13** configurations where it was 1.5–2.8× worse.
+      Bit-identical across four independent runs.
+
+      *Constraints, all checked.* `torch._dynamo.explain` before and after: **1
+      graph, 0 breaks** for every variant, `fullgraph=True` compiles and produces
+      both gradients — **no `allow_in_graph` was needed**, Dynamo inlines
+      `autograd.Function.apply` through the `autograd_function_apply` HOP. Forward
+      **bit-exact** against the default (`torch.equal`, 18 configurations × 2
+      variants) and `tests/test_equivalence.py` is untouched and green.
+      `gradcheck` float64 against input *and* offsets passes for all three
+      variants × constrained/unconstrained × `offset_groups ∈ {1,2,4}`. The
+      `dL/dx` scatter-add is non-deterministic on CUDA for **all three variants
+      including the existing one**; `torch.use_deterministic_algorithms(True)`
+      substitutes a deterministic kernel rather than raising, and all three become
+      bitwise reproducible.
+
+      *Two costs a custom Function brings, both found by testing.* `vmap`/
+      `torch.func` break unless the Function declares `setup_context` **and**
+      `generate_vmap_rule` — `recompute` does; `save-diff` structurally cannot.
+      Double backward: `save-diff` saves `x1 - x0` as a constant, so
+      `d(dL/d offsets)/dx` came out **silently zero** under `create_graph=True`;
+      it now raises. `recompute` is exact. **`recompute` is the only variant that
+      could ever become the default.**
+
+      **Left (owner decisions):**
+      - [ ] **Should `'recompute'` become the default?** It costs 10–23% of eager
+            fwd+bwd for 1.6–2.1× less peak memory, and is strictly better under
+            `torch.compile` (0–12% faster *and* 1.3–1.9× smaller). Recommended as
+            the documented advice for compiled users; not taken as the default,
+            because most users of this package do not compile.
+      - [ ] **Should `'save-diff'` be deleted?** It is dominated by `'recompute'`
+            on every axis except eager latency (0–8% vs 10–23%), and it is the
+            only variant with capability restrictions. It is kept because it
+            separates the cost of the saved difference from the cost of the
+            recomputation, which is what makes §5.9.4's accounting checkable.
+      - [x] README now documents `gather_lerp` under "Going faster, and using
+            less memory", with the `functools.partial` opt-in and the measured
+            trade-off. The snippet was executed.
 - [ ] **Deferred perf work, not attempted:**
       - [ ] Fuse the two `take_along_dim` gathers. `x1` is always `x0` shifted by one
             sample, so a single gather of a `(Lo, K, 2)` window — or a `Tensor.unfold`
             over the receptive field followed by one gather — should halve the gather
-            traffic.
+            traffic. *Lower priority than it was:* Inductor already fuses the forward
+            to 4 launches, so this only helps users who do not compile.
       - [ ] Fold the interpolation and the `F.conv1d` contraction together. The
             `(B, C, Lo, K)` intermediate is the dominant allocation and never needs to
-            be materialised; a `torch.compile`-generated or hand-written fused kernel
-            would remove it.
-      - [ ] A custom autograd `Function` for the interpolation. The backward is
-            currently derived by autograd through gather+lerp, which stores `x0`, `x1`
-            and `frac`; an explicit backward only needs the integer index and `frac`.
+            be materialised. *Partly done by Inductor already* — and peak memory
+            under `torch.compile` **is** now measured, for every gather/lerp
+            variant, by `backends.py --backward` (`BACKENDS.md` §5.9.4). With
+            `gather_lerp='recompute'` the tape is down to 1.03× the output, so the
+            remaining allocation to attack really is the `(B, C, Lo, K)`
+            intermediate itself.
       - [ ] `channels_last`/contiguity study — `x.reshape(B, G, C//G, L)` assumes a
             contiguous channel axis and will silently copy otherwise.
-      - [ ] Benchmark `torch.compile(mode="max-autotune")` end-to-end. Dynamo already
-            traces the layer with zero graph breaks, so this is now reachable; it was
-            not before (`self.device` mutation in `forward`).
+- [ ] **Adopt a `grid_sample` interpolation backend (opt-in) — case narrower again
+      after §5.9.** The surviving case for `grid_sample` rested on two things: a
+      compiled fwd+bwd win and 1.5–2.8× less memory. **The memory half is gone** —
+      with `gather_lerp='recompute'`, compiled dc1d reaches memory parity with
+      `grid_sample/c` in 5 of 13 configurations and comes within 20% in four more,
+      while keeping the bit-exact `nn.Conv1d` invariant `grid_sample` cannot have.
+      The latency half survives but shrinks: `grid_sample/c` still wins fwd+bwd
+      12/13, mean **19%** (was 26% against the stock backward). So `grid_sample`
+      is now **only** for "forward+backward latency is my bottleneck and I accept
+      the exactness loss", or for users who will not compile at all.
+      The original, unchanged case follows.
+      Measured and recommended in `benchmarks/BACKENDS.md` §6.1. In
+      **eager mode** it beats the current kernel in **13/13** measured
+      configurations on an RTX 3090: **1.6–5.3× faster forward, 1.4–2.6× faster
+      fwd+bwd, 1.6–3.9× less forward memory, 2.3–5.2× less fwd+bwd memory** —
+      larger than the 1.5–2× the review estimated.
+      **But under `torch.compile` the forward advantage all but vanishes**
+      (`BACKENDS.md` §5.1): ≤ **13%**, median ~4%, and dc1d's own kernel wins
+      3 of 13. Compilation is worth 2.3–9.1× to dc1d and 0.73–1.6× to
+      `grid_sample` — it is a *regression* for `grid_sample` at four of the
+      larger forward configs, because there is nothing to fuse into
+      `aten::grid_sampler_2d`. Only the **backward** margin survives (13/13,
+      4–74%, §5.2). So: still worth adding for users who will not compile, but
+      **`torch.compile` should be the first recommendation**, and `grid_sample`
+      pitched as "for when the backward is your bottleneck and you can accept
+      the exactness loss" — not as the fast path. `aten::grid_sampler_2d`
+      is an ATen builtin, so **the no-compilation property is preserved** (verified).
+      `gradcheck` passes in float64 against both `input` and `offsets`, and
+      `padding_mode='border'` reproduces dc1d's index clamp exactly.
+      **Must be opt-in, not the default**, for two reasons: (a) the `[-1, 1]`
+      normalisation is lossy, so `tests/test_equivalence.py`'s bit-exact
+      `nn.Conv1d` invariant is lost — position error grows linearly with `L`
+      (`4.6e-3` samples at `L=16000`, `2.3e-2` at `L=65536`); (b) a version that
+      inherits the input dtype **reintroduces C3** — measured at `L=16000` it read
+      the wrong samples entirely, error `6.05×` RMS(x) at fp16 and `5.53×` at bf16.
+      The implementation must force position and sampling arithmetic to ≥ float32
+      from day one.
+      **Left:** move `grid_sample_linterpolate` from `benchmarks/backends.py` into
+      `dc1d/ops.py`; add a tolerance-based equivalence test plus a regression test
+      pinning the fp32 forcing; document backend choice in README/CLAUDE.md.
+      `DeformConv1d` already accepts `interpolation_function`, so no API change.
+- [ ] **A fused Triton kernel is NOT justified** (`BACKENDS.md` §6.2).
+      torchvision's hand-written C++/CUDA `deform_conv2d` is fastest in only 2/13
+      forward configs and is **4–10× slower than pure-PyTorch dc1d** in six
+      depthwise ones — the Conv-TasNet regime this package targets. `grid_sample`
+      beats it in 10/13 with no build step. **Stronger reason now: Inductor
+      already writes the fused kernel** — the compiled forward is 4 CUDA kernel
+      launches, down from 27, and lands within a few percent of `grid_sample`
+      while keeping the sampling bit-exact (§5.5). A hand-written kernel would
+      have to beat that *and* would ship as source, breaking the no-compilation
+      property. **And the cheap software fix for the backward has now been tried
+      and did not deliver** (§5.9): the compiled backward is 30 launches whether
+      the backward is hand-written or derived. What is left really is
+      kernel-level — but it is a mean **19%** on fwd+bwd, against a compiled
+      backward already at 30 launches holding 1.03× the output. Still not worth
+      a build step.
 
 ## Docs
 
@@ -323,9 +501,61 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       native depthwise conv on CPU in this config — that is the honest cost of a
       pure-Python gather-based implementation, and it is *not* representative of
       GPU, where the arithmetic intensity is very different.
-- [ ] **No GPU numbers.** Cannot be produced here (CPU-only torch by design).
-      **Left:** `uv run python benchmarks/benchmark.py --device cuda` on the 3090.
-      Do not quote GPU speedups until then.
+- [x] **`benchmarks/backends.py`** (was `vs_torchvision.py`) — four-way comparison
+      of dc1d, `torchvision.ops.deform_conv2d` degenerated to 1D, an `F.grid_sample`
+      backend, and tinymera's independent implementation (vendored in
+      `benchmarks/_tinymera_ref.py` from `fix/causality` @ `04593f38`).
+      `--check` (equivalence: forward, `d/d input`, `d/d offsets`), `--defects`
+      (dc1d's bug list as executable probes), `--bench`, `--mem`, `--compile-all`,
+      and `--backward` (the gather/lerp backward study: graph breaks, kernel
+      launches, saved-tape footprint, latency, peak memory, determinism).
+      `--configs` and `--backward-variants` cut the sweep down for spot checks.
+      Results and the recommendation: **`benchmarks/BACKENDS.md`**.
+- [x] **Round-robin bias fixed.** `bench_compile_config` now reverses the
+      measurement order on alternate rounds. Plain round-robin equalises drift
+      *between* rounds but not *within* one, so with seven variants the last
+      column was penalised in every round — and min-across-rounds cannot remove a
+      bias present in every round. This was visible: the later columns degraded
+      together on exactly the configurations whose spread was worst. §5.1/§5.2
+      predate the fix; §5.9 uses it.
+- [x] **Idle-GPU spot check of §5** (`BACKENDS.md` §5.9.8). Four configurations
+      re-measured with both cards quiet. **Three reproduce to within 10% and the
+      ordering is unchanged in all four**, so §5.1/§5.2 stand as written and were
+      not re-run. `convtasnet-H512` came out **1.5–1.6× slower on the idle card**
+      — the opposite of what contention would predict — confirming §5.8's reading
+      that its spread is intrinsic to the configuration, not an artefact of a busy
+      GPU. It keeps its ⚠ and carries no conclusion.
+- [x] **GPU numbers now exist for the backend comparison.** RTX 3090, torch
+      2.13.0+cu129, float32, in a separate `.venv-cuda` (the dev venv stays
+      CPU-only and `torchvision` stays out of the runtime dependencies — it is in
+      the non-default `bench` group). See `BACKENDS.md` §4 for the 13-config
+      latency and `max_memory_allocated` tables.
+- [x] **Equivalence established.** dc1d, torchvision and the `grid_sample` backend
+      agree in float64 to `≤ 1.2e-12` (forward), `≤ 1.0e-12` (`d/d input`) and
+      `≤ 1.5e-14` (`d/d offsets`) on interior positions; all four agree at float32.
+      Boundary conventions genuinely differ: dc1d, `grid_sample` (`border`) and
+      tinymera **clamp**; torchvision **zero-pads**. Affects ≤ 0.05% of positions
+      at `L=16000`.
+- [ ] **Still no old-dc1d vs new-dc1d GPU comparison.** `benchmarks/benchmark.py`
+      has not been run with `--device cuda`. **Left:** run it on the 3090.
+      Do not quote a GPU figure for the *rewrite* until then — the `BACKENDS.md`
+      numbers are backend-vs-backend, not before-vs-after.
+- [ ] **Benchmarks ran with torch's Triton ATen overrides disabled**, because this
+      box has no host C compiler and torch 2.13 JIT-builds them on first use (the
+      first CUDA `einsum` raised `RuntimeError: Failed to find C compiler`). The
+      switch is global so the comparison is internally fair, but tinymera's numbers
+      are an ATen `bmm` fallback rather than its best case. **Left:** if tinymera's
+      timings ever matter for a decision, re-run on a box with `gcc` installed.
+      *Update:* the `torch.compile` work (`BACKENDS.md` §5) needed a compiler —
+      Triton builds a CUDA driver shim with `$CC` before Inductor can emit
+      anything — so one was introduced *inside the throwaway CUDA venv only*
+      (`uv pip install ziglang`, plus a one-line `cc` shim; nothing was installed
+      system-wide, so the "no host C compiler" statement above still holds for
+      the box). `backends.py` gained `--triton-overrides {auto,off,on}` and §5
+      pins it `off`, because otherwise the mere presence of a compiler would have
+      flipped the override state and made the compiled numbers incomparable with
+      §4. The check that this worked: §5's eager columns reproduce §4.1 to within
+      a few percent.
 
 ## Release
 
@@ -359,11 +589,48 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
 
 ---
 
+## Cross-repo: tinymera's independent implementation
+
+`tinymera` (private) contains a second, independently written 1D deformable
+convolution by the same author. It was audited against dc1d's seven fixed bugs;
+full table in **`benchmarks/BACKENDS.md` §3**. Reference:
+`fix/causality` @ `04593f38`, open as tinymera PR #1.
+
+- [x] Cross-audit done. Three of the seven classes recurred, one was
+      structurally impossible, two never occurred, and tinymera's fix for one
+      introduced a new defect. The correlated-mistake hypothesis holds
+      specifically for the **contract-validation** classes.
+- [ ] **Report to tinymera PR #1 — `stride > 1` is silently wrong.** The offset
+      network is built with `stride=1` hardcoded
+      (`tinymera/nn/deform_conv1d.py:175-183`) while `self.stride` goes to the
+      sampling kernel, so the module emits `T_in` offset positions instead of
+      `T_out`. Reproduced: `stride=2` returns length 64 where `nn.Conv1d` returns
+      32, tail positions all clamped to the last input sample. This is dc1d's C4,
+      half-fixed (`dilation` *is* forwarded). Survives because
+      `tests/nn/test_deform_conv1d.py` has no stride coverage.
+- [ ] **Report to tinymera PR #1 — `causal=True` leaks future context** whenever
+      `2*padding < dilation*(kernel_size-1)`, including at the module's default
+      `padding=0`. Measured `|d out[32] / d x[t'>32]| = 3.58e-01` at `padding=2`
+      (contract wants ≥ 4) and `4.45e-01` at `padding=0`. Nothing validates the
+      relationship. Neither of these two is what that PR set out to fix.
+- [ ] **Decision needed: retire tinymera's implementation** in favour of a dc1d
+      dependency (`BACKENDS.md` §6.3 recommends yes). It is slower and larger
+      than `dc1d + grid_sample` in 13/13 configs, has no `offset_groups`, and
+      cannot run in float64 — so `gradcheck` cannot be used on it at all, and it
+      has no gradcheck test.
+- [ ] **If retiring: port `causal` into dc1d.** It is the one capability tinymera
+      has that dc1d lacks and it is worth having: left-only padding, offsets
+      clamped to `≤ 0`, and — unlike tinymera — a **validated**
+      padding/dilation relationship that raises instead of silently leaking.
+
 ## Explicitly not done
 
-- Nothing was committed, branched, amended or pushed. All work is uncommitted in
-  the working tree.
-- No GPU was used and no GPU numbers are reported.
+- ~~Nothing was committed, branched, amended or pushed.~~ Superseded: the
+  modernisation work is committed, and the backend comparison lives on
+  `bench/vs-torchvision` (pushed, no PR opened).
+- ~~No GPU was used and no GPU numbers are reported.~~ Superseded for the
+  *backend comparison* only — see `benchmarks/BACKENDS.md` §4 (RTX 3090).
+  Still true for the old-vs-new rewrite comparison.
 - `py.typed` not shipped (see Packaging).
 - No CHANGELOG (see Docs).
 - CI never executed on GitHub (see CI); the YAML itself is unvalidated.

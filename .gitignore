@@ -16,6 +16,9 @@ build_upload.sh
 # Environments
 .venv/
 venv/
+# Throwaway CUDA benchmark environment (see benchmarks/vs_torchvision.py).
+# The dev venv is CPU-only torch by design; GPU numbers need a separate one.
+.venv-cuda/
 
 # Tooling caches
 .pytest_cache/
