@@ -232,3 +232,43 @@ def test_legacy_kernels_agree_and_are_differentiable(kernel, kwargs):
 
     grad_x, grad_offsets = torch.autograd.grad(got.sum(), [x, offsets])
     assert grad_x is not None and grad_offsets is not None
+
+
+@pytest.mark.parametrize("impl", ["save-diff", "recompute"])
+@pytest.mark.parametrize("unconstrained", [False, True])
+@pytest.mark.parametrize("offset_groups", [1, 2, 8])
+@pytest.mark.parametrize("stride,dilation,kernel_size", [(1, 1, 3), (2, 2, 5), (1, 4, 3)])
+def test_custom_backward_forward_is_bit_exact(
+    impl, unconstrained, offset_groups, stride, dilation, kernel_size
+):
+    """
+    The custom-`autograd.Function` variants change only how the backward is
+    computed. Their forward must be **identical**, bit for bit, to the default
+    one -- otherwise the `nn.Conv1d` invariant above no longer covers them.
+    """
+    torch.manual_seed(0)
+    batch, channels, length = 2, 8, 40
+    n_offsets = output_length(length, kernel_size, dilation, stride)
+    x = torch.randn(batch, channels, length, dtype=torch.float64)
+    offsets = torch.randn(batch, offset_groups, n_offsets, kernel_size, dtype=torch.float64) * 3
+
+    want = efficient_linterpolate(
+        x, offsets, kernel_size, dilation, stride, unconstrained=unconstrained
+    )
+    got = efficient_linterpolate(
+        x,
+        offsets,
+        kernel_size,
+        dilation,
+        stride,
+        unconstrained=unconstrained,
+        _gather_lerp=impl,
+    )
+    assert torch.equal(got, want)
+
+
+def test_unknown_gather_lerp_raises():
+    x = torch.randn(1, 2, 8)
+    offsets = torch.zeros(1, 1, output_length(8, 3), 3)
+    with pytest.raises(ValueError, match="unknown gather/lerp implementation"):
+        efficient_linterpolate(x, offsets, 3, 1, 1, _gather_lerp="nope")

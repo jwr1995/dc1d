@@ -17,6 +17,11 @@ __all__ = [
     "output_length",
 ]
 
+# Which gather+lerp implementation `efficient_linterpolate` uses by default.
+# See `_GATHER_LERP_IMPLS` and `benchmarks/BACKENDS.md` section 5.9 for the
+# measurements behind this choice.
+DEFAULT_GATHER_LERP = "autograd"
+
 
 def output_length(
     length: int,
@@ -62,6 +67,143 @@ def _dilated_positions_long(
     return dilated_positions.to(device=device).round().long()
 
 
+# ---------------------------------------------------------------------------
+# The gather + lerp core, and its backward.
+#
+# Every variant computes exactly the same forward:
+#
+#     x0 = x[i],  x1 = x[i + 1],  out = lerp(x0, x1, w)
+#
+# with ``i`` an integer index carrying no gradient and ``w`` the sub-sample
+# fraction. They differ only in how the backward is obtained, and therefore in
+# what has to be kept alive between the forward and the backward:
+#
+#   ``autograd``   let autograd differentiate through ``take_along_dim`` and
+#                  ``lerp``. Correct, and the only variant that needs no
+#                  hand-written maths -- but ``lerp``'s backward needs both
+#                  ``x0`` and ``x1``, so two (B, C, L_out, K) tensors are held.
+#   ``save-diff``  a custom Function that stores the single tensor the offset
+#                  gradient actually needs, ``x1 - x0``. Half the saved
+#                  footprint of ``autograd``.
+#   ``recompute``  a custom Function that stores nothing but the index and the
+#                  fraction and re-gathers ``x0``/``x1`` in the backward. Lowest
+#                  saved footprint; pays two extra gathers.
+#
+# The backward maths, with ``g`` the upstream gradient:
+#
+#     dL/dx    scatter-add ``g * (1 - w)`` at ``i`` and ``g * w`` at ``i + 1``
+#     dL/dw    ``sum_c g * (x1 - x0)``, summed over the channels sharing an
+#              offset group; ``i`` is detached and ``dw/d(offset) == 1``, so
+#              this is also dL/d(offset) before the group reduction.
+#
+# **Determinism.** ``dL/dx`` is a scatter-add, which on CUDA is implemented with
+# atomics and is therefore run-to-run non-deterministic. This is not a
+# regression: the ``autograd`` variant's ``take_along_dim`` backward is the same
+# scatter-add. See ``tests/test_gradients.py::test_scatter_backward_determinism``
+# and BACKENDS.md section 5.9.
+# ---------------------------------------------------------------------------
+
+
+def _gather_pair(xg: Tensor, idx: Tensor) -> tuple[Tensor, Tensor]:
+    """``(x[i], x[i + 1])`` along the length axis of ``(B, G, C/G, L)``."""
+    return torch.take_along_dim(xg, idx, dim=3), torch.take_along_dim(xg, idx + 1, dim=3)
+
+
+def _scatter_input_grad(grad_out: Tensor, idx: Tensor, w: Tensor, length: int) -> Tensor:
+    """
+    ``dL/dx``: accumulate ``g * (1 - w)`` at ``i`` and ``g * w`` at ``i + 1``.
+
+    The two halves are concatenated into a single ``scatter_add_`` rather than
+    issued as two, which halves the number of atomic kernels. The index is
+    ``expand``ed to the channel axis rather than materialised: ``scatter_add_``
+    reads it through a strided iterator, so a stride-0 view costs nothing and
+    avoids an int64 tensor the size of the output -- the same reason the forward
+    uses ``take_along_dim`` rather than ``gather``.
+    """
+    batch, groups, per_group, _ = grad_out.shape
+    hi = grad_out * w
+    lo = grad_out - hi  # == grad_out * (1 - w) up to one rounding
+    src = torch.cat((lo, hi), dim=3)
+    index = torch.cat((idx, idx + 1), dim=3).expand(batch, groups, per_group, src.shape[3])
+    grad_x = torch.zeros(
+        (batch, groups, per_group, length), device=grad_out.device, dtype=grad_out.dtype
+    )
+    return grad_x.scatter_add_(3, index, src)
+
+
+def _gather_lerp_autograd(xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:
+    """Plain autograd: the historical implementation."""
+    x0, x1 = _gather_pair(xg, idx)
+    return torch.lerp(x0, x1, w)
+
+
+class _GatherLerpSaveDiff(torch.autograd.Function):
+    """Custom Function saving ``x1 - x0`` instead of both ``x0`` and ``x1``."""
+
+    @staticmethod
+    def forward(ctx, xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:  # type: ignore[override]
+        x0, x1 = _gather_pair(xg, idx)
+        # `torch.lerp`, not `x0 + w * (x1 - x0)`: at w == 1 (a tap clamped
+        # against the right edge) lerp returns x1 exactly, while the algebraic
+        # form returns x0 + (x1 - x0), which is not x1 in floating point. The
+        # nn.Conv1d bit-exactness invariant depends on this.
+        out = torch.lerp(x0, x1, w)
+        ctx.save_for_backward(idx, w, x1 - x0)
+        ctx.length = xg.shape[3]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):  # type: ignore[override]
+        idx, w, diff = ctx.saved_tensors
+        grad_x = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_x = _scatter_input_grad(grad_out, idx, w, ctx.length)
+        if ctx.needs_input_grad[2]:
+            grad_w = (grad_out * diff).sum(dim=2, keepdim=True)
+        return grad_x, None, grad_w
+
+
+class _GatherLerpRecompute(torch.autograd.Function):
+    """Custom Function saving nothing but the index and the fraction."""
+
+    @staticmethod
+    def forward(ctx, xg: Tensor, idx: Tensor, w: Tensor) -> Tensor:  # type: ignore[override]
+        x0, x1 = _gather_pair(xg, idx)
+        out = torch.lerp(x0, x1, w)
+        ctx.save_for_backward(xg, idx, w)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):  # type: ignore[override]
+        xg, idx, w = ctx.saved_tensors
+        grad_x = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_x = _scatter_input_grad(grad_out, idx, w, xg.shape[3])
+        if ctx.needs_input_grad[2]:
+            x0, x1 = _gather_pair(xg, idx)
+            grad_w = (grad_out * (x1 - x0)).sum(dim=2, keepdim=True)
+        return grad_x, None, grad_w
+
+
+_GATHER_LERP_IMPLS = {
+    "autograd": _gather_lerp_autograd,
+    "save-diff": _GatherLerpSaveDiff.apply,
+    "recompute": _GatherLerpRecompute.apply,
+}
+
+
+def _resolve_gather_lerp(name: str | None):
+    if name is None or name == "auto":
+        name = DEFAULT_GATHER_LERP
+    try:
+        return _GATHER_LERP_IMPLS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown gather/lerp implementation {name!r}; "
+            f"expected one of {sorted(_GATHER_LERP_IMPLS)}"
+        ) from None
+
+
 def efficient_linterpolate(
     x: Tensor,
     offsets: Tensor,
@@ -72,6 +214,7 @@ def efficient_linterpolate(
     device: torch.device | str | None = None,  # deprecated, ignored; kept for back-compat
     _test: bool = False,
     unconstrained: bool = False,
+    _gather_lerp: str | None = None,
 ) -> Tensor:
     """
     Memory-efficient linear interpolation of the deformed sampling positions.
@@ -90,6 +233,11 @@ def efficient_linterpolate(
         unconstrained (bool): When ``False`` (default) each kernel tap is confined
             to its own receptive field. When ``True`` taps may sample anywhere in
             the sequence.
+        _gather_lerp: Private. Which gather+lerp implementation to use --
+            ``'autograd'``, ``'save-diff'`` or ``'recompute'``. All three produce
+            the same forward bit-for-bit and differ only in how the backward is
+            obtained; the choice exists so ``benchmarks/backends.py`` can compare
+            them. ``None`` means :data:`DEFAULT_GATHER_LERP`.
 
     Returns:
         Tensor of shape ``(batch, channels, out_length, kernel_size)``.
@@ -180,17 +328,13 @@ def efficient_linterpolate(
     per_group = channels // groups
     xg = x.reshape(batch, groups, per_group, length)
     idx = index.reshape(batch, groups, 1, out_length * kernel_size)
-
-    x0 = torch.take_along_dim(xg, idx, dim=3).reshape(
-        batch, groups, per_group, out_length, kernel_size
-    )
-    x1 = torch.take_along_dim(xg, idx + 1, dim=3).reshape(
-        batch, groups, per_group, out_length, kernel_size
-    )
+    weight = frac.to(x.dtype).reshape(batch, groups, 1, out_length * kernel_size)
 
     # x1 is by construction x0's right neighbour, so the two bilinear weights are
-    # exactly (1 - frac) and frac -- i.e. a lerp.
-    out = torch.lerp(x0, x1, frac.to(x0.dtype).unsqueeze(2))
+    # exactly (1 - frac) and frac -- i.e. a lerp. The tap axis stays flattened
+    # through the gather so that the (1, out_length * kernel_size) index and
+    # fraction broadcast across the channels of their offset group.
+    out = _resolve_gather_lerp(_gather_lerp)(xg, idx, weight)
     return out.reshape(batch, channels, out_length, kernel_size)
 
 
