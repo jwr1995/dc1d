@@ -113,6 +113,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 import torch
@@ -1507,6 +1508,758 @@ def _mem_worker(payload: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# torch.compile
+# ---------------------------------------------------------------------------
+#
+# PR #9 removed the `self.device` mutation in `DeformConv1d.forward` and made
+# `dilated_positions` a non-persistent buffer, which took the layer to 0 graph
+# breaks / 1 graph under `torch._dynamo.explain`. Everything in this section
+# depends on that: before it, Dynamo could not trace the layer cleanly and none
+# of these measurements were reachable.
+#
+# The question this section exists to answer: BACKENDS.md 5.1 recommends
+# `grid_sample` on the strength of winning 13/13 configurations *in eager mode*.
+# `grid_sample` is one opaque ATen kernel that Inductor cannot fuse into;
+# dc1d's kernel is a chain of fusible elementwise ops around two gathers. If
+# dc1d's path is memory-bandwidth-bound, compilation should help it more, and
+# the recommendation may not survive.
+
+
+@dataclass(frozen=True)
+class Variant:
+    """One (backend, compilation mode) pair. ``mode is None`` means eager."""
+
+    label: str
+    base: str
+    mode: str | None = None
+
+    @property
+    def compiled(self) -> bool:
+        return self.mode is not None
+
+
+# Eager rows are re-measured inside every compiled sweep rather than quoted from
+# section 4, so that the eager and compiled numbers in one table come from the
+# same process, the same round-robin, and the same thermal state.
+DEFAULT_VARIANTS: list[Variant] = [
+    Variant("dc1d", "dc1d"),
+    Variant("dc1d/c", "dc1d", "default"),
+    Variant("gs", "grid_sample"),
+    Variant("gs/c", "grid_sample", "default"),
+    Variant("tv/c", "torchvision", "default"),
+]
+
+AUTOTUNE_VARIANTS: list[Variant] = [
+    Variant("dc1d", "dc1d"),
+    Variant("dc1d/c", "dc1d", "default"),
+    Variant("dc1d/ma", "dc1d", "max-autotune"),
+    Variant("gs", "grid_sample"),
+    Variant("gs/c", "grid_sample", "default"),
+    Variant("gs/ma", "grid_sample", "max-autotune"),
+]
+
+# max-autotune costs minutes of compile time per (config, phase), so it gets a
+# capped subset rather than the full grid: one small, two depthwise-dilated, one
+# wide-kernel and two speech-length configs.
+AUTOTUNE_NAMES = ("small", "medium", "wide-kernel-dw", "speech-4x256", "speech-dense")
+AUTOTUNE_GRID: list[Config] = [c for c in GRID if c.name in AUTOTUNE_NAMES]
+
+
+def _distinct_wrapper(fn, tag: str):
+    """
+    Wrap ``fn`` in a function with its own *code object*.
+
+    Dynamo's compiled-code cache is keyed on the code object, so compiling the
+    same function twice at two different ``mode``s would otherwise pile both
+    entries onto one cache and make the second lookup depend on guard ordering.
+    A fresh code object per variant keeps the two compilations completely
+    independent. The wrapper is inlined into the graph, so it costs nothing at
+    steady state, and it is applied to the eager variants too so that every row
+    in a table pays the same Python overhead.
+    """
+    namespace = {"_fn": fn}
+    exec(f"def _call_{tag}(*a):\n    return _fn(*a)\n", namespace)  # noqa: S102
+    return namespace[f"_call_{tag}"]
+
+
+def _variant_callable(variant: Variant, cfg: Config, tensors: tuple):
+    """Return ``(fn, args)`` for ``variant``; ``fn`` is compiled when asked."""
+    x, offsets, offsets_tv, layer, vanilla = tensors
+    if variant.base == "dc1d":
+        fn, args = layer, (x, offsets)
+    elif variant.base == "grid_sample":
+        fn, args = (
+            grid_sample_deform_conv1d,
+            (x, offsets, layer.weight, layer.bias, cfg.stride, cfg.dilation, cfg.groups),
+        )
+    elif variant.base == "torchvision":
+        fn, args = (
+            tv_deform_conv1d,
+            (x, offsets_tv, layer.weight, layer.bias, cfg.stride, cfg.dilation),
+        )
+    elif variant.base == "nn.Conv1d":
+        fn, args = vanilla, (x,)
+    else:  # pragma: no cover - programming error
+        raise ValueError(f"unknown base {variant.base!r}")
+
+    tag = variant.label.replace("/", "_").replace("+", "_").replace(".", "_").replace("-", "_")
+    fn = _distinct_wrapper(fn, tag)
+    if variant.compiled:
+        # fullgraph=True is a *claim under test*, not a convenience: if dc1d's
+        # layer ever regains a graph break this raises rather than silently
+        # measuring a partially compiled graph. torchvision's `deform_conv2d`
+        # is an opaque custom op and is allowed to fall back.
+        try:
+            fn = torch.compile(fn, mode=variant.mode, fullgraph=True)
+        except Exception:  # noqa: BLE001 - fall back and say so in the report
+            fn = torch.compile(fn, mode=variant.mode, fullgraph=False)
+    return fn, args
+
+
+def _run_once(fn, args, requires_grad: bool, device: str) -> None:
+    y = fn(*args)
+    if requires_grad:
+        y.sum().backward()
+    if device.startswith("cuda"):
+        torch.cuda.synchronize(device)
+
+
+def _compile_and_warm(fn, args, requires_grad: bool, device: str, warmup: int = 3) -> float:
+    """
+    Execute ``fn`` once and return the wall-clock seconds it took.
+
+    For a compiled variant that first call *is* the compile: Dynamo traces,
+    AOTAutograd partitions, Inductor codegens and Triton builds, all lazily.
+    Reporting it separately is the point -- it is a real cost that a short job
+    never amortises. The remaining ``warmup`` calls bring every variant to the
+    same state before the timer starts, matching `bench_config`.
+    """
+    start = time.perf_counter()
+    _run_once(fn, args, requires_grad, device)
+    elapsed = time.perf_counter() - start
+    for _ in range(warmup):
+        _run_once(fn, args, requires_grad, device)
+    return elapsed
+
+
+def bench_compile_config(
+    cfg: Config,
+    variants: list[Variant],
+    device: str,
+    dtype: torch.dtype,
+    min_run_time: float,
+    rounds: int = 3,
+) -> dict:
+    """
+    Time every variant on ``cfg``, plus the one-off compile cost of each.
+
+    Same defensive protocol as `bench_config` -- round-robin within each round,
+    minimum across rounds -- so the compiled and eager rows of a table are
+    directly comparable. Dynamo is reset per (config, phase) so that each
+    compile time is a real compile and not a cache hit on the previous config.
+    """
+    row: dict = {"name": cfg.name, "label": cfg.label}
+
+    for phase, requires_grad in (("fwd", False), ("fwd+bwd", True)):
+        torch._dynamo.reset()
+        x, offsets, offsets_tv, _offsets_tm, layer, vanilla, _ = make_inputs(
+            cfg, device, dtype, requires_grad
+        )
+        tensors = (x, offsets, offsets_tv, layer, vanilla)
+
+        built: dict[str, tuple] = {}
+        for v in variants:
+            fn, args = _variant_callable(v, cfg, tensors)
+            row[f"{v.label} {phase} compile"] = _compile_and_warm(fn, args, requires_grad, device)
+            built[v.label] = (fn, args)
+
+        samples: dict[str, list[float]] = {v.label: [] for v in variants}
+        for _ in range(rounds):
+            for v in variants:
+                fn, args = built[v.label]
+                m = _timer(
+                    "y = fn(*args); y.sum().backward()" if requires_grad else "fn(*args)",
+                    {"fn": fn, "args": args},
+                    cfg.label,
+                    f"{v.label} ({phase})",
+                    min_run_time,
+                )
+                samples[v.label].append(m.median)
+
+        spread = 1.0
+        for label, values in samples.items():
+            row[f"{label} {phase}"] = min(values)
+            spread = max(spread, max(values) / min(values))
+        row[f"spread {phase}"] = spread
+
+        del x, offsets, offsets_tv, layer, vanilla, tensors, built
+        torch._dynamo.reset()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    return row
+
+
+def print_compile_table(rows: list[dict], variants: list[Variant], title: str) -> None:
+    ref_label = variants[0].label
+    for phase, tag in (("fwd", "forward"), ("fwd+bwd", "forward+backward")):
+        print(f"\n### {title} -- {tag}\n")
+        others = [v.label for v in variants[1:]]
+        header = ["config", ref_label, *others, "spread"]
+        widths = [34, 9, *([17] * len(others)), 7]
+        body = []
+        for r in rows:
+            ref = r[f"{ref_label} {phase}"] * 1e3
+            cells = [r["label"], f"{ref:.3f}"]
+            for label in others:
+                t = r[f"{label} {phase}"] * 1e3
+                cells.append(f"{t:.3f} ({ref / t:.2f}x)")
+            cells.append(f"{r.get(f'spread {phase}', 1.0):.2f}x")
+            body.append(cells)
+        _emit_table(header, widths, body)
+
+        print(f"\n### {title} -- {tag}, compile + first-call cost (s)\n")
+        header = ["config", *[v.label for v in variants]]
+        widths = [34, *([12] * len(variants))]
+        body = []
+        for r in rows:
+            cells = [r["label"]]
+            for v in variants:
+                cells.append(f"{r[f'{v.label} {phase} compile']:.2f}")
+            body.append(cells)
+        _emit_table(header, widths, body)
+    print(
+        f"\n(times in ms, minimum over rounds; the bracketed factor is {ref_label} / variant, "
+        f"so > 1x means FASTER than eager {ref_label}.\n"
+        " '/c' is torch.compile(mode='default'), '/ma' is mode='max-autotune'.\n"
+        " The compile table is wall-clock seconds for the FIRST call, which is where\n"
+        " tracing, AOTAutograd partitioning, Inductor codegen and the Triton build all\n"
+        " happen. It is paid once per process per shape and is not amortised by short jobs.)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compiled-output correctness
+# ---------------------------------------------------------------------------
+
+
+def compile_correctness(device: str) -> int:
+    """
+    Does compilation preserve what makes dc1d's kernel worth preferring?
+
+    Three claims, checked independently of the timing loop:
+
+    1.  compiled == eager, **bit for bit**, forward and both gradients;
+    2.  compiled dc1d still reproduces `nn.Conv1d` bit-exactly at zero offsets
+        -- the `tests/test_equivalence.py` invariant, the single load-bearing
+        test in this package;
+    3.  `torch.autograd.gradcheck` still passes in float64 against both `input`
+        and `offsets`.
+
+    **Every call is fed a different tensor.** A harness that reuses one input
+    cannot distinguish a correct implementation from one that returns the
+    previous call's result, and a compiled callable backed by CUDA graphs is
+    exactly the kind of thing that can develop a one-call lag. Each iteration
+    therefore checks `compiled(x_i) == eager(x_i)` *and* asserts that
+    `eager(x_i) != eager(x_{i-1})`, so the equality cannot pass vacuously.
+    """
+    print("\n" + "=" * 78)
+    print("COMPILED-OUTPUT CORRECTNESS (independent of the timing loop)")
+    print("=" * 78)
+    failures = 0
+    torch.manual_seed(0)
+
+    cases = [
+        Config("small", 2, 16, 256, 3, 1, 1),
+        Config("depthwise-dilated", 2, 32, 512, 3, 4, 32, offset_groups=8),
+        Config("wide-strided", 2, 16, 1024, 5, 2, 1, stride=3),
+    ]
+    modes = ["default", "max-autotune"]
+
+    print("\n--- 1. compiled vs eager, bit for bit, on a stream of DISTINCT inputs ---\n")
+    for mode in modes:
+        for cfg in cases:
+            torch._dynamo.reset()
+            out_len = output_length(cfg.length, cfg.kernel_size, cfg.dilation, cfg.stride)
+            layer = DeformConv1d(
+                cfg.channels,
+                cfg.channels,
+                cfg.kernel_size,
+                stride=cfg.stride,
+                dilation=cfg.dilation,
+                groups=cfg.groups,
+                padding="valid",
+                unconstrained=True,
+            ).to(device)
+            compiled = torch.compile(_distinct_wrapper(layer, "cc"), mode=mode, fullgraph=True)
+
+            worst_fwd = worst_gx = worst_go = 0.0
+            distinct = True
+            prev_eager = None
+            for i in range(4):
+                torch.manual_seed(100 + i)
+                x = torch.randn(cfg.batch, cfg.channels, cfg.length, device=device)
+                offsets = torch.randn(
+                    cfg.batch, cfg.offset_groups, out_len, cfg.kernel_size, device=device
+                )
+                xe = x.clone().requires_grad_(True)
+                oe = offsets.clone().requires_grad_(True)
+                xc = x.clone().requires_grad_(True)
+                oc = offsets.clone().requires_grad_(True)
+
+                torch.compiler.cudagraph_mark_step_begin()
+                ye = layer(xe, oe)
+                ye.sum().backward()
+                torch.compiler.cudagraph_mark_step_begin()
+                yc = compiled(xc, oc)
+                yc.sum().backward()
+
+                # `.clone()` because a CUDA-graph-backed output aliases a buffer
+                # the next iteration overwrites; comparing it later would be
+                # exactly the silent lag this loop exists to catch.
+                ye, yc = ye.detach().clone(), yc.detach().clone()
+                if prev_eager is not None and torch.equal(ye, prev_eager):
+                    distinct = False
+                prev_eager = ye
+
+                worst_fwd = max(worst_fwd, (yc - ye).abs().max().item())
+                worst_gx = max(worst_gx, (xc.grad - xe.grad).abs().max().item())
+                worst_go = max(worst_go, (oc.grad - oe.grad).abs().max().item())
+
+            exact = worst_fwd == 0.0 and worst_gx == 0.0 and worst_go == 0.0
+            ok = exact and distinct
+            failures += 0 if ok else 1
+            print(
+                f"  mode={mode:<13} {cfg.label:<40} "
+                f"fwd {worst_fwd:.3e}  d/dx {worst_gx:.3e}  d/doff {worst_go:.3e}  "
+                f"inputs-distinct {distinct}  {'BIT-EXACT' if exact else 'DIFFERS'}"
+            )
+            del layer, compiled
+            torch._dynamo.reset()
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+    print("\n--- 2. the nn.Conv1d invariant (tests/test_equivalence.py) under compilation ---\n")
+    for mode in modes:
+        for stride, dilation, groups, ksize in ((1, 1, 1, 3), (2, 3, 1, 5), (1, 2, 8, 3)):
+            torch._dynamo.reset()
+            channels, length, batch = 8, 128, 2
+            layer = DeformConv1d(
+                channels,
+                channels,
+                ksize,
+                stride=stride,
+                dilation=dilation,
+                groups=groups,
+                padding="valid",
+                unconstrained=True,
+            ).to(device=device, dtype=torch.float64)
+            vanilla = nn.Conv1d(
+                channels,
+                channels,
+                ksize,
+                stride=stride,
+                dilation=dilation,
+                groups=groups,
+                padding="valid",
+            ).to(device=device, dtype=torch.float64)
+            vanilla.weight.data = layer.weight.data.clone()
+            vanilla.bias.data = layer.bias.data.clone()
+            out_len = output_length(length, ksize, dilation, stride)
+            x = torch.randn(batch, channels, length, device=device, dtype=torch.float64)
+            offsets = torch.zeros(batch, 1, out_len, ksize, device=device, dtype=torch.float64)
+            compiled = torch.compile(_distinct_wrapper(layer, "eq"), mode=mode, fullgraph=True)
+            torch.compiler.cudagraph_mark_step_begin()
+            err_c = (compiled(x, offsets) - vanilla(x)).abs().max().item()
+            err_e = (layer(x, offsets) - vanilla(x)).abs().max().item()
+            failures += 0 if err_c == 0.0 else 1
+            print(
+                f"  mode={mode:<13} s={stride} d={dilation} g={groups} K={ksize:<3} "
+                f"eager {err_e:.3e}  compiled {err_c:.3e}  "
+                f"{'BIT-EXACT' if err_c == 0.0 else 'LOST'}"
+            )
+            del layer, vanilla, compiled
+            torch._dynamo.reset()
+
+    print("\n--- 3. gradcheck (float64) on the compiled kernel ---\n")
+    for mode in modes:
+        torch._dynamo.reset()
+        channels, length, ksize = 4, 32, 3
+        out_len = output_length(length, ksize, 1, 1)
+        interp = torch.compile(
+            _distinct_wrapper(efficient_linterpolate, "gc"), mode=mode, fullgraph=True
+        )
+
+        def _probe(a, b, _fn=interp, _k=ksize):
+            return _fn(a, b, _k, 1, 1, None, None, False, True)
+
+        x = torch.randn(1, channels, length, device=device, dtype=torch.float64, requires_grad=True)
+        offsets = (
+            torch.randn(1, 1, out_len, ksize, device=device, dtype=torch.float64)
+            .clamp(-1.5, 1.5)
+            .requires_grad_(True)
+        )
+        try:
+            ok = torch.autograd.gradcheck(_probe, (x, offsets), eps=1e-6, atol=1e-8)
+        except Exception as exc:  # noqa: BLE001 - report, do not abort the sweep
+            ok = False
+            print(f"  mode={mode:<13} gradcheck RAISED: {type(exc).__name__}: {str(exc)[:200]}")
+        else:
+            print(f"  mode={mode:<13} gradcheck (input, offsets) -> {'PASS' if ok else 'FAIL'}")
+        failures += 0 if ok else 1
+        torch._dynamo.reset()
+
+    print(f"\ncompiled-output correctness: {failures} failure(s)")
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Recompilation across shapes
+# ---------------------------------------------------------------------------
+
+
+def _unique_graphs() -> int:
+    from torch._dynamo.utils import counters
+
+    return counters["stats"].get("unique_graphs", 0)
+
+
+def recompilation_study(device: str, dtype: torch.dtype, min_run_time: float) -> None:
+    """
+    How many graphs does a compiled dc1d layer need across a run whose sequence
+    length varies, and does `mark_dynamic` on the length axis cost anything?
+
+    This matters because dc1d's target workload -- speech separation -- has
+    variable-length utterances. If every new length triggers a fresh Inductor
+    compile, the steady-state win is irrelevant.
+    """
+    from torch._dynamo.utils import counters
+
+    print("\n" + "=" * 78)
+    print("RECOMPILATION ACROSS SHAPES")
+    print("=" * 78)
+
+    channels, batch, ksize = 128, 4, 3
+    lengths = (1024, 2048, 4096, 8192, 16384)
+
+    def build(length):
+        out_len = output_length(length, ksize, 1, 1)
+        x = torch.randn(batch, channels, length, device=device, dtype=dtype)
+        offsets = torch.randn(batch, 1, out_len, ksize, device=device, dtype=dtype)
+        return x, offsets
+
+    for tag, dynamic in (("static (default)", False), ("mark_dynamic(length)", True)):
+        torch._dynamo.reset()
+        counters.clear()
+        layer = DeformConv1d(channels, channels, ksize, padding="valid", unconstrained=True).to(
+            device=device, dtype=dtype
+        )
+        compiled = torch.compile(_distinct_wrapper(layer, "shp"), fullgraph=True)
+
+        print(f"\n  {tag}")
+        per_length = []
+        for length in lengths:
+            before = _unique_graphs()
+            x, offsets = build(length)
+            if dynamic:
+                torch._dynamo.mark_dynamic(x, 2)
+                torch._dynamo.mark_dynamic(offsets, 2)
+            start = time.perf_counter()
+            compiled(x, offsets)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+            first = time.perf_counter() - start
+            after = _unique_graphs()
+            per_length.append((length, after - before, first))
+            print(
+                f"    L={length:<6} new graphs: {after - before}  "
+                f"first call: {first:7.2f} s  (cumulative graphs: {after})"
+            )
+
+        # Steady state at one length, to price the dynamic-shape guard chain.
+        length = 4096
+        x, offsets = build(length)
+        if dynamic:
+            torch._dynamo.mark_dynamic(x, 2)
+            torch._dynamo.mark_dynamic(offsets, 2)
+        for _ in range(4):
+            compiled(x, offsets)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize(device)
+        m = _timer("fn(*args)", {"fn": compiled, "args": (x, offsets)}, "shapes", tag, min_run_time)
+        print(f"    steady state at L=4096: {m.median * 1e3:.3f} ms")
+        del layer, compiled
+        torch._dynamo.reset()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Kernel-launch counts
+# ---------------------------------------------------------------------------
+
+
+def _count_cuda_kernels(fn, args, requires_grad: bool, device: str) -> int:
+    """
+    Number of CUDA kernel launches in one call, from `torch.profiler`.
+
+    `key_averages()` aggregates by name, so the count is summed over entries
+    whose `device_type` is CUDA -- that is kernels, not the CPU-side operator
+    dispatch. Warmed first, so lazy allocations and autotuning are not counted.
+    """
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    for _ in range(3):
+        _run_once(fn, args, requires_grad, device)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        _run_once(fn, args, requires_grad, device)
+    return sum(e.count for e in prof.key_averages() if e.device_type == DeviceType.CUDA)
+
+
+def _load_prerewrite_ops():
+    """
+    Import the pre-rewrite `dc1d/ops.py` (``eac995f^``) as a throwaway module.
+
+    Same technique BACKENDS.md 4.5(b) used for the RSS comparison. Returns
+    ``None`` if it cannot be loaded, which is a reportable outcome rather than
+    a failure: the old file imports private torchvision internals at module
+    scope and eagerly ``torch.jit.script``s a helper.
+    """
+    import importlib.util
+    import tempfile
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        source = subprocess.run(
+            ["git", "-C", repo, "show", "eac995f^:dc1d/ops.py"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (pre-rewrite ops.py unavailable: {type(exc).__name__}: {exc})")
+        return None
+
+    path = os.path.join(tempfile.mkdtemp(), "ops_prerewrite.py")
+    with open(path, "w") as handle:
+        handle.write(source)
+    try:
+        spec = importlib.util.spec_from_file_location("dc1d_ops_prerewrite", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (pre-rewrite ops.py failed to import: {type(exc).__name__}: {exc})")
+        return None
+    return module
+
+
+def kernel_launch_counts(device: str, dtype: torch.dtype) -> None:
+    """
+    Settle the last unmeasured claim in TODO.md: "~25 kernels -> ~5".
+
+    That figure was a static reading of the diff, never a profile. Counted here
+    for the interpolation kernel alone (which is what the claim is about) and
+    for the whole layer, eager and compiled, forward and forward+backward.
+    """
+    print("\n" + "=" * 78)
+    print("CUDA KERNEL LAUNCHES PER CALL (torch.profiler, activities=[CUDA])")
+    print("=" * 78)
+
+    if not device.startswith("cuda"):
+        print("  skipped: requires a CUDA device")
+        return
+
+    cfg = Config("launch-probe", 4, 64, 4096, 3, 1, 1)
+    out_len = output_length(cfg.length, cfg.kernel_size, cfg.dilation, cfg.stride)
+    print(f"\n  config: {cfg.label}\n")
+
+    rows: list[tuple[str, str, str]] = []
+
+    old = _load_prerewrite_ops()
+
+    for phase, requires_grad in (("fwd", False), ("fwd+bwd", True)):
+        x = torch.randn(
+            cfg.batch,
+            cfg.channels,
+            cfg.length,
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        offsets = torch.randn(
+            cfg.batch, cfg.offset_groups, out_len, cfg.kernel_size, device=device, dtype=dtype
+        ).requires_grad_(requires_grad)
+        layer = DeformConv1d(
+            cfg.channels, cfg.channels, cfg.kernel_size, padding="valid", unconstrained=True
+        ).to(device=device, dtype=dtype)
+
+        entries: list[tuple[str, object, tuple]] = []
+        if old is not None:
+            entries.append(
+                (
+                    "interp: efficient_linterpolate (pre-rewrite, eac995f^)",
+                    old.efficient_linterpolate,
+                    (
+                        x,
+                        offsets,
+                        cfg.kernel_size,
+                        cfg.dilation,
+                        cfg.stride,
+                        None,
+                        device,
+                        False,
+                        True,
+                    ),
+                )
+            )
+        entries += [
+            (
+                "interp: efficient_linterpolate (current)",
+                efficient_linterpolate,
+                (x, offsets, cfg.kernel_size, cfg.dilation, cfg.stride, None, None, False, True),
+            ),
+            (
+                "interp: grid_sample_linterpolate",
+                grid_sample_linterpolate,
+                (x, offsets, cfg.kernel_size, cfg.dilation, cfg.stride, True),
+            ),
+            ("layer: dc1d (eager)", layer, (x, offsets)),
+            (
+                "layer: grid_sample (eager)",
+                grid_sample_deform_conv1d,
+                (x, offsets, layer.weight, layer.bias, cfg.stride, cfg.dilation, cfg.groups),
+            ),
+        ]
+
+        for name, fn, args in entries:
+            try:
+                count = _count_cuda_kernels(fn, args, requires_grad, device)
+                rows.append((name, phase, str(count)))
+            except Exception as exc:  # noqa: BLE001
+                rows.append((name, phase, f"failed ({type(exc).__name__})"))
+
+        for label, mode in (
+            ("layer: dc1d (compiled)", "default"),
+            ("layer: grid_sample (compiled)", "default"),
+        ):
+            torch._dynamo.reset()
+            base = layer if "dc1d" in label else grid_sample_deform_conv1d
+            args = (
+                (x, offsets)
+                if "dc1d" in label
+                else (x, offsets, layer.weight, layer.bias, cfg.stride, cfg.dilation, cfg.groups)
+            )
+            compiled = torch.compile(_distinct_wrapper(base, "kl"), mode=mode, fullgraph=True)
+            try:
+                count = _count_cuda_kernels(compiled, args, requires_grad, device)
+                rows.append((label, phase, str(count)))
+            except Exception as exc:  # noqa: BLE001
+                rows.append((label, phase, f"failed ({type(exc).__name__})"))
+            del compiled
+            torch._dynamo.reset()
+
+        del x, offsets, layer
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    names = []
+    for name, _, _ in rows:
+        if name not in names:
+            names.append(name)
+    body = []
+    for name in names:
+        cells = [name]
+        for phase in ("fwd", "fwd+bwd"):
+            match = [v for n, p, v in rows if n == name and p == phase]
+            cells.append(match[0] if match else "-")
+        body.append(cells)
+    _emit_table(["what", "fwd", "fwd+bwd"], [54, 10, 10], body)
+    print(
+        "\n(one call, warmed first. Counts are CUDA kernel launches -- the sum of\n"
+        " per-kernel counts from torch.profiler's key_averages() restricted to\n"
+        " DeviceType.CUDA -- not ATen operator calls.)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cold compile cost
+# ---------------------------------------------------------------------------
+
+
+def cold_compile_cost(device: str, dtype_name: str) -> None:
+    """
+    Compile time with a *cold* Inductor and Triton cache, in a fresh process.
+
+    The in-sweep compile numbers are measured with whatever the on-disk
+    FX-graph cache happens to hold, which understates what a user pays on a
+    machine that has never run this shape. Each measurement here gets its own
+    empty `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR`, so it is the honest
+    worst case: the number a short job actually has to earn back.
+    """
+    import shutil
+    import tempfile
+
+    print("\n" + "=" * 78)
+    print("COLD-CACHE COMPILE COST (fresh process, empty Inductor + Triton caches)")
+    print("=" * 78)
+
+    cfg = Config("speech-4x256", 4, 256, 16000, 3, 8, 256, offset_groups=256)
+    body = []
+    for base in ("dc1d", "grid_sample"):
+        for mode in ("default", "max-autotune"):
+            cells = [f"{base} / {mode}"]
+            for phase in ("fwd", "fwd+bwd"):
+                tmp = tempfile.mkdtemp()
+                env = dict(os.environ)
+                env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(tmp, "inductor")
+                env["TRITON_CACHE_DIR"] = os.path.join(tmp, "triton")
+                payload = json.dumps(
+                    {
+                        "cfg": cfg.__dict__,
+                        "base": base,
+                        "mode": mode,
+                        "phase": phase,
+                        "dtype": dtype_name,
+                        "device": device,
+                    }
+                )
+                proc = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__), "--compile-worker", payload],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=env,
+                )
+                shutil.rmtree(tmp, ignore_errors=True)
+                if proc.returncode != 0:
+                    cells.append("failed")
+                    print(f"    worker failed for {base}/{mode}/{phase}: {proc.stderr[-400:]}")
+                else:
+                    cells.append(f"{float(proc.stdout.strip().splitlines()[-1]):.1f}")
+            body.append(cells)
+    print(f"\n  config: {cfg.label}\n")
+    _emit_table(["backend / mode", "fwd (s)", "fwd+bwd (s)"], [28, 12, 14], body)
+    print(
+        "\n(wall-clock seconds for the first call in a fresh process with empty caches,\n"
+        " excluding interpreter start and `import torch`. Steady-state speedups have to\n"
+        " repay this before a job is ahead.)"
+    )
+
+
+def _compile_worker(payload: str) -> None:
+    spec = json.loads(payload)
+    cfg = Config(**spec["cfg"])
+    dtype = getattr(torch, spec["dtype"])
+    device = spec["device"]
+    requires_grad = spec["phase"] == "fwd+bwd"
+    x, offsets, offsets_tv, _tm, layer, vanilla, _ = make_inputs(cfg, device, dtype, requires_grad)
+    variant = Variant("w", spec["base"], spec["mode"])
+    fn, args = _variant_callable(variant, cfg, (x, offsets, offsets_tv, layer, vanilla))
+    print(_compile_and_warm(fn, args, requires_grad, device, warmup=0))
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -1568,7 +2321,7 @@ def print_memory_table(rows: list[dict], title: str, unit: str) -> None:
     )
 
 
-def maybe_disable_triton_overrides() -> str:
+def maybe_disable_triton_overrides(policy: str = "auto") -> str:
     """
     torch 2.13 ships Triton-DSL overrides for a handful of ATen ops (notably
     ``einsum`` -> ``_bmm_outer_product``) that are JIT-compiled on first use.
@@ -1584,12 +2337,28 @@ def maybe_disable_triton_overrides() -> str:
     same dispatch regime and the comparison stays internally fair -- but the
     absolute tinymera figures are "ATen fallback", not "best possible".
 
+    ``policy``:
+
+    *   ``auto`` -- the historical behaviour: disable only when no compiler is
+        visible.
+    *   ``off`` -- disable unconditionally. **This is what the ``--compile``
+        sweeps use.** ``torch.compile`` needs a host C compiler, but the eager
+        tables in ``BACKENDS.md`` were measured on this box *without* one and
+        therefore with the overrides off. Installing a compiler to make
+        Inductor work would, under ``auto``, silently switch every backend to a
+        different dispatch regime and make the new numbers incomparable with
+        the old ones. ``off`` keeps the regime fixed and moves exactly one
+        variable.
+    *   ``on`` -- leave them registered.
+
     Returns a human-readable status string for the environment report.
     """
     import shutil
 
     compiler = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
-    if compiler:
+    if policy == "on":
+        return f"enabled by request (C compiler: {compiler or 'none'})"
+    if compiler and policy == "auto":
         return f"enabled (C compiler: {compiler})"
     try:
         from torch._native import registry as _native_registry
@@ -1597,15 +2366,18 @@ def maybe_disable_triton_overrides() -> str:
         _native_registry.deregister_op_overrides(disable_dsl_names=["triton"])
     except Exception as exc:  # noqa: BLE001 - best effort, older torch has no _native
         return f"not applicable ({type(exc).__name__})"
+    if compiler:
+        return f"DISABLED by request (a C compiler IS present: {compiler}); ATen fallbacks in use"
     return "DISABLED -- no host C compiler, Triton JIT unavailable; ATen fallbacks in use"
 
 
-def environment_report(device: str) -> None:
+def environment_report(device: str, triton_overrides: str = "auto") -> None:
     print("=" * 78)
     print(f"torch          : {torch.__version__}")
     print(f"torchvision    : {TORCHVISION_VERSION}")
     print(f"tinymera ref   : {TINYMERA_REF}")
-    print(f"triton overrides: {maybe_disable_triton_overrides()}")
+    print(f"triton overrides: {maybe_disable_triton_overrides(triton_overrides)}")
+    print(f"host C compiler: {os.environ.get('CC') or 'not set'}")
     print(f"python         : {sys.version.split()[0]}")
     print(f"device         : {device}")
     if device.startswith("cuda"):
@@ -1631,6 +2403,45 @@ def main() -> int:
     parser.add_argument("--bench", action="store_true", help="run timing sweep only")
     parser.add_argument("--mem", action="store_true", help="run memory sweep only")
     parser.add_argument("--all", action="store_true", help="check + defects + bench + mem")
+    parser.add_argument(
+        "--compile", action="store_true", help="torch.compile timing sweep (eager vs default)"
+    )
+    parser.add_argument(
+        "--compile-autotune",
+        action="store_true",
+        help="torch.compile timing sweep including mode='max-autotune' (capped grid)",
+    )
+    parser.add_argument(
+        "--compile-check",
+        action="store_true",
+        help="compiled-vs-eager bit-exactness, the nn.Conv1d invariant, and gradcheck",
+    )
+    parser.add_argument(
+        "--compile-shapes", action="store_true", help="recompilation / mark_dynamic study"
+    )
+    parser.add_argument(
+        "--compile-cold", action="store_true", help="cold-cache compile cost, fresh subprocesses"
+    )
+    parser.add_argument(
+        "--launches", action="store_true", help="CUDA kernel-launch counts via torch.profiler"
+    )
+    parser.add_argument(
+        "--compile-all",
+        action="store_true",
+        help="compile-check + compile + compile-autotune + compile-shapes + compile-cold "
+        "+ launches",
+    )
+    parser.add_argument(
+        "--triton-overrides",
+        default="auto",
+        choices=["auto", "off", "on"],
+        help="torch 2.13 Triton-DSL ATen overrides. 'auto' disables them when no host C "
+        "compiler is visible (the historical behaviour). 'off' disables them "
+        "unconditionally, which is what keeps a run comparable with the eager tables in "
+        "BACKENDS.md -- those were measured on a box with no compiler, and torch.compile "
+        "needs one, so simply installing a compiler would silently change the dispatch "
+        "regime for every backend.",
+    )
     parser.add_argument("--min-run-time", type=float, default=0.3)
     parser.add_argument(
         "--rounds",
@@ -1640,10 +2451,15 @@ def main() -> int:
     )
     parser.add_argument("--sweeps", action="store_true", help="also run the L and C sweeps")
     parser.add_argument("--mem-worker", help=argparse.SUPPRESS)
+    parser.add_argument("--compile-worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.mem_worker:
         _mem_worker(args.mem_worker)
+        return 0
+    if args.compile_worker:
+        maybe_disable_triton_overrides(args.triton_overrides)
+        _compile_worker(args.compile_worker)
         return 0
 
     if not HAVE_TORCHVISION:
@@ -1654,10 +2470,22 @@ def main() -> int:
         print(__doc__.split("Degenerating")[0].split("torchvision is *not*")[1])
         return 2
 
-    if not (args.check or args.defects or args.bench or args.mem):
+    compile_flags = (
+        args.compile
+        or args.compile_autotune
+        or args.compile_check
+        or args.compile_shapes
+        or args.compile_cold
+        or args.launches
+        or args.compile_all
+    )
+    if not (args.check or args.defects or args.bench or args.mem or compile_flags):
         args.all = True
     if args.all:
         args.check = args.defects = args.bench = args.mem = True
+    if args.compile_all:
+        args.compile_check = args.compile = args.compile_autotune = True
+        args.compile_shapes = args.compile_cold = args.launches = True
 
     if args.device.startswith("cuda"):
         # torch.utils.benchmark synchronises the *current* device, so pin it or
@@ -1665,7 +2493,7 @@ def main() -> int:
         torch.cuda.set_device(args.device)
 
     dtype = getattr(torch, args.dtype)
-    environment_report(args.device)
+    environment_report(args.device, args.triton_overrides)
 
     failures = 0
     if args.check:
@@ -1693,6 +2521,31 @@ def main() -> int:
         else:
             rows = [measure_cpu_memory(c, args.dtype) for c in GRID]
             print_memory_table(rows, "Peak CPU memory", "RSS above post-setup baseline")
+
+    if args.compile_check:
+        failures += compile_correctness(args.device)
+    if args.compile:
+        rows = [
+            bench_compile_config(c, DEFAULT_VARIANTS, args.device, dtype, args.min_run_time, 3)
+            for c in GRID
+        ]
+        print_compile_table(
+            rows, DEFAULT_VARIANTS, f"torch.compile (default) -- {args.device}, {args.dtype}"
+        )
+    if args.compile_autotune:
+        rows = [
+            bench_compile_config(c, AUTOTUNE_VARIANTS, args.device, dtype, args.min_run_time, 3)
+            for c in AUTOTUNE_GRID
+        ]
+        print_compile_table(
+            rows, AUTOTUNE_VARIANTS, f"torch.compile (max-autotune) -- {args.device}, {args.dtype}"
+        )
+    if args.compile_shapes:
+        recompilation_study(args.device, dtype, args.min_run_time)
+    if args.launches:
+        kernel_launch_counts(args.device, dtype)
+    if args.compile_cold:
+        cold_compile_cost(args.device, args.dtype)
 
     return 1 if failures else 0
 
