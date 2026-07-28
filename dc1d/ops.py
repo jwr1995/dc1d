@@ -96,11 +96,16 @@ def _dilated_positions_long(
 #              offset group; ``i`` is detached and ``dw/d(offset) == 1``, so
 #              this is also dL/d(offset) before the group reduction.
 #
-# **Determinism.** ``dL/dx`` is a scatter-add, which on CUDA is implemented with
-# atomics and is therefore run-to-run non-deterministic. This is not a
-# regression: the ``autograd`` variant's ``take_along_dim`` backward is the same
-# scatter-add. See ``tests/test_gradients.py::test_scatter_backward_determinism``
-# and BACKENDS.md section 5.9.
+# **Determinism.** ``dL/dx`` is a scatter-add, which on CUDA accumulates with
+# atomics and is therefore *not* bitwise reproducible run to run. Measured, for
+# all three variants alike -- this is not something the custom Function
+# introduces, because the ``autograd`` variant's ``take_along_dim`` backward is
+# the same scatter-add. ``dL/d(offsets)`` is a plain reduction and is
+# reproducible. Under ``torch.use_deterministic_algorithms(True)`` PyTorch
+# substitutes a deterministic ``scatter_add_`` rather than raising, and all
+# three variants become bitwise reproducible; nothing here needs a
+# ``deterministic`` opt-out. See BACKENDS.md section 5.9 and
+# ``tests/test_gradients.py::test_input_gradient_scatter_is_deterministic_on_cpu``.
 # ---------------------------------------------------------------------------
 
 
@@ -148,7 +153,14 @@ class _GatherLerpSaveDiff(torch.autograd.Function):
         # form returns x0 + (x1 - x0), which is not x1 in floating point. The
         # nn.Conv1d bit-exactness invariant depends on this.
         out = torch.lerp(x0, x1, w)
-        ctx.save_for_backward(idx, w, x1 - x0)
+        # `x1 - x0` is read by the offset gradient and by nothing else, so an
+        # inference pass must not pay for it: without this guard the forward is
+        # 5-17% slower than the plain-autograd kernel (BACKENDS.md 5.9).
+        # `ctx.needs_input_grad` is populated before `forward` runs; it is not
+        # affected by `torch.no_grad()`, which is the one case this still
+        # over-computes -- inference on a leaf that happens to require grad.
+        diff = x1 - x0 if ctx.needs_input_grad[2] else None
+        ctx.save_for_backward(idx, w, diff)
         ctx.length = xg.shape[3]
         return out
 
