@@ -2038,6 +2038,29 @@ def compile_correctness(device: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _gpu_warmup(device: str, seconds: float = 2.0) -> None:
+    """
+    Burn the GPU for a moment before a one-shot measurement.
+
+    An RTX 3090 sitting at idle clocks is several times slower than the same
+    card mid-sweep. `bench_config` is immune -- it measures round-robin and
+    reports the minimum over rounds -- but a study that times one thing once,
+    first thing in the process, is not: an early version of this function
+    reported 2.56 ms for a configuration the sweep measures at 0.31 ms, purely
+    because the clocks had not come up.
+    """
+    if not device.startswith("cuda"):
+        return
+    a = torch.randn(2048, 2048, device=device)
+    start = time.perf_counter()
+    while time.perf_counter() - start < seconds:
+        for _ in range(20):
+            a = a @ a.T / 2048.0
+        torch.cuda.synchronize(device)
+    del a
+    torch.cuda.empty_cache()
+
+
 def _unique_graphs() -> int:
     from torch._dynamo.utils import counters
 
@@ -2070,6 +2093,7 @@ def recompilation_study(device: str, dtype: torch.dtype, min_run_time: float) ->
     print("RECOMPILATION ACROSS SHAPES")
     print("=" * 78)
 
+    _gpu_warmup(device)
     channels, batch, ksize = 128, 4, 3
     lengths = (1024, 2048, 4096, 8192, 16384)
 
@@ -2134,10 +2158,17 @@ def recompilation_study(device: str, dtype: torch.dtype, min_run_time: float) ->
                 compiled(x, offsets)
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
-            m = _timer(
-                "fn(*args)", {"fn": compiled, "args": (x, offsets)}, "shapes", tag, min_run_time
+            best = min(
+                _timer(
+                    "fn(*args)",
+                    {"fn": compiled, "args": (x, offsets)},
+                    "shapes",
+                    tag,
+                    min_run_time,
+                ).median
+                for _ in range(3)
             )
-            print(f"    steady state at L=4096: {m.median * 1e3:.3f} ms")
+            print(f"    steady state at L=4096: {best * 1e3:.3f} ms (min of 3)")
 
         del layer, compiled
         torch._dynamo.reset()
