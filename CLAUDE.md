@@ -10,6 +10,18 @@ The selling point is that it needs **no C++/CUDA compilation**: everything rides
 
 **Writing style.** Do not use em dashes. Use commas, colons, semicolons, parentheses, or a new sentence instead. Use emoji sparingly, and only where they carry information (a status column, for example), never as decoration. Prefer plain ASCII where it costs nothing: hyphens for numeric ranges, `x` or the word "times" rather than a multiplication sign in prose. Formatting should prioritise readability and portability, so favour short paragraphs, plain tables, and fenced code blocks over anything that depends on a particular renderer.
 
+**Pull request descriptions: short, and mostly bullets.** A reviewer should get the whole picture in under a minute.
+
+- Lead with one or two sentences on what changed and why it matters. No preamble, no throat-clearing headers.
+- Then bullets. Use prose only where a bullet genuinely cannot carry the idea.
+- One bullet per claim, each with its evidence attached: the measurement, the file:line, or the test that proves it. A claim with no evidence should either get some or be cut.
+- A table beats a paragraph for anything with more than two dimensions (before/after, config/result, bug/symptom).
+- State known limitations and anything deliberately not done. That section is not optional, and it is often the most useful part.
+- Do not restate the diff. The reviewer can read it. Explain what is not obvious from reading it.
+- Do not editorialise about urgency or importance. Give the facts and let them speak.
+
+The same applies to commit messages: a short imperative subject, then bullets or short paragraphs explaining why rather than what.
+
 **Delegate chores and benchmarking to subagents.** Routine mechanical work (dependency bumps, lint sweeps, formatting, docstring fixes, test scaffolding, file moves) and *all* benchmarking should be dispatched to a subagent rather than done inline. Benchmarking in particular is long-running and produces a lot of output that is not worth carrying in the main context; a subagent should run the sweep and report the table and the conclusion.
 
 Use `uv` for everything: `uv run pytest`, `uv run ruff check`, `uv sync`. Do not call `pip` or a bare `python`. The dev environment pins Python 3.12 and CPU-only torch; the published wheel requires `torch>=2.4` on any supported Python.
