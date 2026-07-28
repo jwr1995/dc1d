@@ -1640,7 +1640,7 @@ def _with_gather_lerp(layer: DeformConv1d, name: str | None) -> DeformConv1d:
     if name is None:
         return layer
     clone = copy.copy(layer)
-    clone.interpolation_function = functools.partial(efficient_linterpolate, _gather_lerp=name)
+    clone.interpolation_function = functools.partial(efficient_linterpolate, gather_lerp=name)
     assert clone.weight is layer.weight, "copy.copy(DeformConv1d) did not share parameters"
     return clone
 
@@ -2001,7 +2001,7 @@ def backward_determinism(device: str, dtype: torch.dtype) -> int:
 
             def once(impl=impl):
                 out = efficient_linterpolate(
-                    x, offsets, kernel_size, 1, 1, unconstrained=True, _gather_lerp=impl
+                    x, offsets, kernel_size, 1, 1, unconstrained=True, gather_lerp=impl
                 )
                 return torch.autograd.grad(out, [x, offsets], grad_out)
 
@@ -2062,7 +2062,7 @@ def graph_break_check(device: str, dtype: torch.dtype) -> int:
                     dilation=1,
                     stride=1,
                     unconstrained=True,
-                    _gather_lerp=impl,
+                    gather_lerp=impl,
                 ),
             ),
             ("layer", variant),

@@ -262,7 +262,7 @@ def test_custom_backward_forward_is_bit_exact(
         dilation,
         stride,
         unconstrained=unconstrained,
-        _gather_lerp=impl,
+        gather_lerp=impl,
     )
     assert torch.equal(got, want)
 
@@ -271,4 +271,4 @@ def test_unknown_gather_lerp_raises():
     x = torch.randn(1, 2, 8)
     offsets = torch.zeros(1, 1, output_length(8, 3), 3)
     with pytest.raises(ValueError, match="unknown gather/lerp implementation"):
-        efficient_linterpolate(x, offsets, 3, 1, 1, _gather_lerp="nope")
+        efficient_linterpolate(x, offsets, 3, 1, 1, gather_lerp="nope")

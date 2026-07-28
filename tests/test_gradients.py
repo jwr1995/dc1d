@@ -135,7 +135,7 @@ def test_gradcheck_gather_lerp_variants(impl, unconstrained, offset_groups):
 
     assert torch.autograd.gradcheck(
         lambda a, b: efficient_linterpolate(
-            a, b, KERNEL, dilation=1, stride=1, unconstrained=unconstrained, _gather_lerp=impl
+            a, b, KERNEL, dilation=1, stride=1, unconstrained=unconstrained, gather_lerp=impl
         ),
         (x, offsets),
         eps=1e-6,
@@ -166,9 +166,7 @@ def test_custom_backward_matches_autograd(impl):
         grad_out,
     )
     got = torch.autograd.grad(
-        efficient_linterpolate(
-            x, offsets, kernel_size, 1, 1, unconstrained=True, _gather_lerp=impl
-        ),
+        efficient_linterpolate(x, offsets, kernel_size, 1, 1, unconstrained=True, gather_lerp=impl),
         [x, offsets],
         grad_out,
     )
@@ -191,7 +189,7 @@ def test_input_gradient_scatter_is_deterministic_on_cpu(impl):
 
     def once():
         return torch.autograd.grad(
-            efficient_linterpolate(x, offsets, KERNEL, 1, 1, unconstrained=True, _gather_lerp=impl),
+            efficient_linterpolate(x, offsets, KERNEL, 1, 1, unconstrained=True, gather_lerp=impl),
             [x, offsets],
             grad_out,
         )
@@ -210,7 +208,7 @@ def _interp(impl):
     n_offsets = output_length(LENGTH, KERNEL)
 
     def fn(a, b):
-        return efficient_linterpolate(a, b, KERNEL, 1, 1, unconstrained=True, _gather_lerp=impl)
+        return efficient_linterpolate(a, b, KERNEL, 1, 1, unconstrained=True, gather_lerp=impl)
 
     return fn, n_offsets
 

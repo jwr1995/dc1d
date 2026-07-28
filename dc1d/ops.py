@@ -200,7 +200,7 @@ class _GatherLerpSaveDiff(torch.autograd.Function):
             raise RuntimeError(
                 "the 'save-diff' gather/lerp backward does not support double backward "
                 "(create_graph=True): it saves x1 - x0 as a constant, so the second-order "
-                "term through the input would be silently zero. Use _gather_lerp='recompute' "
+                "term through the input would be silently zero. Use gather_lerp='recompute' "
                 "or the default 'autograd'."
             )
         idx, w, diff = ctx.saved_tensors
@@ -275,7 +275,7 @@ def efficient_linterpolate(
     device: torch.device | str | None = None,  # deprecated, ignored; kept for back-compat
     _test: bool = False,
     unconstrained: bool = False,
-    _gather_lerp: str | None = None,
+    gather_lerp: str | None = None,
 ) -> Tensor:
     """
     Memory-efficient linear interpolation of the deformed sampling positions.
@@ -294,11 +294,27 @@ def efficient_linterpolate(
         unconstrained (bool): When ``False`` (default) each kernel tap is confined
             to its own receptive field. When ``True`` taps may sample anywhere in
             the sequence.
-        _gather_lerp: Private. Which gather+lerp implementation to use --
-            ``'autograd'``, ``'save-diff'`` or ``'recompute'``. All three produce
-            the same forward bit-for-bit and differ only in how the backward is
-            obtained; the choice exists so ``benchmarks/backends.py`` can compare
-            them. ``None`` means :data:`DEFAULT_GATHER_LERP`.
+        gather_lerp (str, optional): How the backward is computed. All three
+            options produce the **same forward, bit for bit**, and the same
+            gradients to within rounding; they differ only in what is kept alive
+            between the forward and the backward. ``None`` means
+            :data:`DEFAULT_GATHER_LERP`.
+
+            * ``'autograd'`` (default) -- differentiate through
+              ``take_along_dim`` and ``lerp``. No restrictions.
+            * ``'recompute'`` -- a custom :class:`torch.autograd.Function` that
+              saves only the integer index and the fraction. Measured on an RTX
+              3090 (``benchmarks/BACKENDS.md`` section 5.9): **1.6-2.1x lower
+              peak memory** eager and **1.5-1.9x** under ``torch.compile``, for
+              **10-23% slower** eager forward+backward and **0-19% faster**
+              compiled forward+backward. Supports ``vmap`` and double backward.
+              Worth choosing when peak memory is the constraint, and worth
+              choosing unconditionally under ``torch.compile``.
+            * ``'save-diff'`` -- saves ``x1 - x0``. Same compiled behaviour as
+              ``'recompute'`` and a smaller eager latency cost (0-8%) for a
+              smaller memory saving (1.6-1.8x), but it is **not** usable with
+              ``vmap``/``torch.func`` and **raises** under ``create_graph=True``.
+              Kept for measurement; do not build on it.
 
     Returns:
         Tensor of shape ``(batch, channels, out_length, kernel_size)``.
@@ -395,7 +411,7 @@ def efficient_linterpolate(
     # exactly (1 - frac) and frac -- i.e. a lerp. The tap axis stays flattened
     # through the gather so that the (1, out_length * kernel_size) index and
     # fraction broadcast across the channels of their offset group.
-    out = _resolve_gather_lerp(_gather_lerp)(xg, idx, weight)
+    out = _resolve_gather_lerp(gather_lerp)(xg, idx, weight)
     return out.reshape(batch, channels, out_length, kernel_size)
 
 
