@@ -1961,6 +1961,69 @@ def backward_launch_counts(device: str, dtype: torch.dtype) -> None:
     _emit_table(["what", "fwd", "fwd+bwd"], [44, 10, 10], body)
 
 
+def backward_saved_footprint(device: str, dtype: torch.dtype) -> None:
+    """
+    What each variant *holds* between the forward and the backward.
+
+    This is the quantity the peak-memory table is a noisy proxy for, and it can
+    be read directly: allocate the inputs, take a baseline, run one forward with
+    ``requires_grad=True``, and see how much is still allocated. Everything above
+    the output tensor itself is the autograd tape.
+
+    Expressed as a multiple of the output so the accounting is checkable by
+    hand. For ``offset_groups=1`` the ``autograd`` variant should come out at
+    ~7x: the output, ``x0``, ``x1``, and -- the part that is easy to miss --
+    ``take_along_dim``'s backward saving its *broadcast* int64 index at full
+    output size, twice, at 2x the output's fp32 size each.
+    """
+    print("\n" + "=" * 78)
+    print("HELD BETWEEN FORWARD AND BACKWARD (torch.cuda.memory_allocated)")
+    print("=" * 78)
+    if not device.startswith("cuda"):
+        print("  skipped: requires a CUDA device")
+        return
+
+    for cfg in (
+        Config("small", 4, 64, 1024, 3, 1, 1),
+        Config("medium", 4, 256, 2048, 3, 8, 256, offset_groups=256),
+        Config("wide-kernel", 4, 128, 4096, 15, 1, 1),
+    ):
+        out_len = output_length(cfg.length, cfg.kernel_size, cfg.dilation, cfg.stride)
+        out_mib = (
+            cfg.batch
+            * cfg.channels
+            * out_len
+            * cfg.kernel_size
+            * torch.empty((), dtype=dtype).element_size()
+            / 2**20
+        )
+        print(f"\n  {cfg.label} og={cfg.offset_groups}: output = {out_mib:.1f} MiB")
+        for impl in ("autograd", "save-diff", "recompute"):
+            x = torch.randn(
+                cfg.batch, cfg.channels, cfg.length, device=device, dtype=dtype, requires_grad=True
+            )
+            offsets = torch.randn(
+                cfg.batch, cfg.offset_groups, out_len, cfg.kernel_size, device=device, dtype=dtype
+            ).requires_grad_(True)
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            base = torch.cuda.memory_allocated(device)
+            y = efficient_linterpolate(
+                x,
+                offsets,
+                cfg.kernel_size,
+                cfg.dilation,
+                cfg.stride,
+                unconstrained=True,
+                gather_lerp=impl,
+            )
+            torch.cuda.synchronize(device)
+            held = (torch.cuda.memory_allocated(device) - base) / 2**20
+            print(f"    {impl:<10} {held:9.1f} MiB = {held / out_mib:5.2f} x output")
+            del x, offsets, y
+            torch.cuda.empty_cache()
+
+
 def backward_determinism(device: str, dtype: torch.dtype) -> int:
     """
     Does the input gradient reproduce run to run, and what happens under
@@ -3125,6 +3188,7 @@ def main() -> int:
         else:
             failures += graph_break_check(args.device, dtype)
             backward_launch_counts(args.device, dtype)
+            backward_saved_footprint(args.device, dtype)
             failures += backward_determinism(args.device, dtype)
         backward_study(args.device, dtype, args.min_run_time, args.rounds, grid, variants)
 
