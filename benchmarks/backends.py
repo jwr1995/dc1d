@@ -1737,8 +1737,17 @@ def bench_compile_config(
             built[v.label] = (fn, args)
 
         samples: dict[str, list[float]] = {v.label: [] for v in variants}
-        for _ in range(rounds):
-            for v in variants:
+        for round_index in range(rounds):
+            # Alternate the direction of the round-robin. Plain round-robin
+            # controls for slow drift *between* rounds but not for drift
+            # *within* one: with seven variants and a card that heats over a
+            # ~10 s round, whatever is measured last is systematically
+            # penalised, and min-across-rounds does not remove a bias that is
+            # present in every round. Reversing every other round makes each
+            # variant last half the time. This showed up as a real effect in
+            # the section 5.9 sweeps -- see the note there.
+            order = variants if round_index % 2 == 0 else list(reversed(variants))
+            for v in order:
                 fn, args = built[v.label]
                 m = _timer(
                     "y = fn(*args); y.sum().backward()" if requires_grad else "fn(*args)",
@@ -2092,22 +2101,21 @@ def backward_study(
     min_run_time: float,
     rounds: int,
     configs: list[Config],
+    variants: list[Variant] | None = None,
 ) -> None:
     """Latency + peak memory for every gather+lerp variant, plus `grid_sample/c`."""
-    rows = [
-        bench_compile_config(c, BACKWARD_VARIANTS, device, dtype, min_run_time, rounds)
-        for c in configs
-    ]
+    variants = variants or BACKWARD_VARIANTS
+    rows = [bench_compile_config(c, variants, device, dtype, min_run_time, rounds) for c in configs]
     print_compile_table(
         rows,
-        BACKWARD_VARIANTS,
+        variants,
         f"custom autograd.Function -- {device}, {_dtype_name(dtype)}",
     )
     if device.startswith("cuda"):
-        mem_rows = [measure_variant_memory(c, BACKWARD_VARIANTS, device, dtype) for c in configs]
+        mem_rows = [measure_variant_memory(c, variants, device, dtype) for c in configs]
         print_variant_memory_table(
             mem_rows,
-            BACKWARD_VARIANTS,
+            variants,
             f"Peak CUDA memory, gather+lerp variants -- {device}, {_dtype_name(dtype)}",
         )
 
@@ -2963,6 +2971,13 @@ def main() -> int:
         "kernel launches and determinism for every gather+lerp variant",
     )
     parser.add_argument(
+        "--backward-variants",
+        default="",
+        help="comma-separated subset of the --backward variant labels (default: all). "
+        "A shorter list means a shorter round-robin and therefore less within-round "
+        "drift, which matters for the decisive dc1d/c vs sd/c vs gs/c comparison.",
+    )
+    parser.add_argument(
         "--configs",
         default="",
         help="comma-separated subset of the grid to run (default: all), e.g. "
@@ -3099,10 +3114,19 @@ def main() -> int:
     if args.compile_cold:
         cold_compile_cost(args.device, args.dtype)
     if args.backward:
-        failures += graph_break_check(args.device, dtype)
-        backward_launch_counts(args.device, dtype)
-        failures += backward_determinism(args.device, dtype)
-        backward_study(args.device, dtype, args.min_run_time, args.rounds, grid)
+        variants = BACKWARD_VARIANTS
+        if args.backward_variants:
+            wanted = [n.strip() for n in args.backward_variants.split(",") if n.strip()]
+            unknown = [n for n in wanted if n not in {v.label for v in BACKWARD_VARIANTS}]
+            if unknown:
+                print(f"unknown variant label(s): {unknown}")
+                return 2
+            variants = [v for v in BACKWARD_VARIANTS if v.label in wanted]
+        else:
+            failures += graph_break_check(args.device, dtype)
+            backward_launch_counts(args.device, dtype)
+            failures += backward_determinism(args.device, dtype)
+        backward_study(args.device, dtype, args.min_run_time, args.rounds, grid, variants)
 
     return 1 if failures else 0
 
