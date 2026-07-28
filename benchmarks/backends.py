@@ -30,6 +30,13 @@ This script answers three questions:
     shapes with ``torch.utils.benchmark.Timer`` (forward and forward+backward
     timed separately, equal warmup on all contenders) and ``--mem`` measures
     peak memory.
+4.  **Does ``torch.compile`` change the answer?**  ``--compile-all`` re-runs
+    the same grid under Inductor. This became possible only after the
+    ``self.device`` mutation was removed from ``forward``; before that Dynamo
+    could not trace the layer without a graph break. The question matters
+    because ``grid_sample`` is one opaque ATen kernel Inductor cannot fuse
+    into, while dc1d's kernel is a fusible chain -- so the eager-mode
+    comparison in ``BACKENDS.md`` section 4 may not be the whole story.
 
 torchvision is *not* a dependency of dc1d and must not become one. Install it
 into a throwaway environment:
@@ -44,6 +51,30 @@ into a throwaway environment:
         torch==2.13.0+cu129 torchvision==0.28.0+cu129
     VIRTUAL_ENV=.venv-cuda uv pip install -e . --no-deps
     .venv-cuda/bin/python benchmarks/backends.py --all --device cuda
+
+
+``torch.compile`` needs a host C compiler
+-----------------------------------------
+Triton builds a small CUDA driver shim with ``$CC`` the first time Inductor
+emits a kernel, so ``--compile*`` cannot run on a box without one. This machine
+has no system compiler (which is also why the Triton ATen overrides are
+disabled -- see ``maybe_disable_triton_overrides``), so the measurements were
+taken with a self-contained one from PyPI:
+
+    VIRTUAL_ENV=.venv-cuda uv pip install ziglang
+    printf '#!/bin/sh\\nexec .venv-cuda/bin/python -m ziglang cc "$@"\\n' > /tmp/bin/cc
+    CC=/tmp/bin/cc PATH=/tmp/bin:$PATH .venv-cuda/bin/python benchmarks/backends.py \\
+        --compile-all --device cuda:0 --triton-overrides off
+
+(``zig``'s ``lld`` does not resolve Triton's ``-l:libcuda.so.1`` against ``-L``
+paths, so the shim rewrites that one argument to an absolute path.)
+
+``--triton-overrides off`` is **not optional** for comparability. Installing a
+compiler flips ``maybe_disable_triton_overrides`` from "disabled" to "enabled",
+which would silently re-dispatch several ATen ops through Triton for *every*
+backend and make the new numbers incomparable with the eager tables already in
+``BACKENDS.md``. Pinning it ``off`` keeps the dispatch regime identical and
+leaves ``torch.compile`` as the only variable that moved.
 
 
 Degenerating 2D -> 1D
