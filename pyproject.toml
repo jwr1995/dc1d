@@ -44,6 +44,15 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
 ]
+# Everything `docs/demo.ipynb` needs, kept out of the runtime dependencies.
+#   uv sync --group demo
+#   uv run --group demo jupyter nbconvert --to notebook --execute --inplace docs/demo.ipynb
+demo = [
+    "jupyter>=1.1",
+    "matplotlib>=3.8",
+    "nbconvert>=7.16",
+    "notebook>=7.2",
+]
 # Benchmark-only. `torchvision` is NOT a dependency of dc1d -- removing it is
 # the point of the current work -- and this group is deliberately not in
 # `default-groups`, so a plain `uv sync` never installs it. It exists only so
