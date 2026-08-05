@@ -1,0 +1,88 @@
+############ 1. As shipped: dc1d 0.0.7 vs dc1d 0.1.0, float32
+A = old/float32  (out/old_fp32.pt)
+B = new/float32  (out/new_fp32.pt)
+  encoder output mix_w         torch.equal = True
+  separated waveform           torch.equal = False
+  max |A - B|                  = 6.245057e+00
+  rms  (A - B)                 = 1.216640e+00
+  max |A|                      = 1.285398e+01
+  SI-SDR(B vs A), speaker 0    = 4.840 dB
+  SI-SDR(B vs A), speaker 1    = 4.985 dB
+  deformable layers with differing offsets: 23/24
+  max |offset difference| over all layers : 7.813357e+00
+
+  layer                  dilation  offsets equal   max |diff|  offset scale
+  temporalblock_0_0             1           True   0.0000e+00        5.0428
+  temporalblock_0_1             2          False   4.5537e+00        4.9002
+  temporalblock_0_2             4          False   5.6672e+00        5.8880
+  temporalblock_0_3             8          False   4.5350e+00        5.2037
+  temporalblock_0_4            16          False   5.6189e+00        5.1844
+  temporalblock_0_5            32          False   7.8134e+00        7.7384
+  temporalblock_0_6            64          False   5.0731e+00        5.0161
+  temporalblock_0_7           128          False   4.5697e+00        4.8152
+  temporalblock_1_0             1          False   4.0854e+00        4.9235
+  temporalblock_1_1             2          False   6.2535e+00        6.2157
+  temporalblock_1_2             4          False   4.8619e+00        4.6651
+  temporalblock_1_3             8          False   5.4652e+00        5.2939
+  temporalblock_1_4            16          False   4.2545e+00        3.9926
+  temporalblock_1_5            32          False   4.2264e+00        3.7399
+  temporalblock_1_6            64          False   4.7295e+00        4.0985
+  temporalblock_1_7           128          False   5.4003e+00        6.1856
+  temporalblock_2_0             1          False   4.0471e+00        7.0583
+  temporalblock_2_1             2          False   4.0208e+00        4.3898
+  temporalblock_2_2             4          False   7.5219e+00        6.2088
+  temporalblock_2_3             8          False   5.8754e+00        6.1171
+  temporalblock_2_4            16          False   5.9306e+00        5.2953
+  temporalblock_2_5            32          False   4.5634e+00        5.1118
+  temporalblock_2_6            64          False   6.1302e+00        5.8414
+  temporalblock_2_7           128          False   4.3519e+00        4.0037
+
+############ 2. Interpolation kernel change only (0.1.0 with 0.0.7 offset-conv wiring), float32
+A = old/float32  (out/old_fp32.pt)
+B = new/float32/compat  (out/new_fp32_compat.pt)
+  encoder output mix_w         torch.equal = True
+  separated waveform           torch.equal = False
+  max |A - B|                  = 1.876187e-02
+  rms  (A - B)                 = 3.111676e-03
+  max |A|                      = 1.285398e+01
+  SI-SDR(B vs A), speaker 0    = 57.570 dB
+  SI-SDR(B vs A), speaker 1    = 57.759 dB
+  deformable layers with differing offsets: 23/24
+  max |offset difference| over all layers : 2.197051e-02
+
+############ 3. Same, float64
+A = old/float64  (out/old_fp64.pt)
+B = new/float64/compat  (out/new_fp64_compat.pt)
+  encoder output mix_w         torch.equal = True
+  separated waveform           torch.equal = False
+  max |A - B|                  = 5.955236e-12
+  rms  (A - B)                 = 8.149948e-13
+  max |A|                      = 1.285863e+01
+  SI-SDR(B vs A), speaker 0    = 249.114 dB
+  SI-SDR(B vs A), speaker 1    = 249.488 dB
+  deformable layers with differing offsets: 23/24
+  max |offset difference| over all layers : 4.892198e-12
+
+############ 4. Each float32 run against the float64 evaluation of the same network
+A = old/float32  (out/old_fp32.pt)
+B = new/float64/compat  (out/new_fp64_compat.pt)
+  encoder output mix_w         torch.equal = False
+  separated waveform           torch.equal = False
+  max |A - B|                  = 3.351901e-02
+  rms  (A - B)                 = 5.671478e-03
+  max |A|                      = 1.285398e+01
+  SI-SDR(B vs A), speaker 0    = 52.353 dB
+  SI-SDR(B vs A), speaker 1    = 52.550 dB
+  deformable layers with differing offsets: 24/24
+  max |offset difference| over all layers : 3.261001e-02
+A = new/float32/compat  (out/new_fp32_compat.pt)
+B = new/float64/compat  (out/new_fp64_compat.pt)
+  encoder output mix_w         torch.equal = False
+  separated waveform           torch.equal = False
+  max |A - B|                  = 3.998029e-02
+  rms  (A - B)                 = 5.684156e-03
+  max |A|                      = 1.285107e+01
+  SI-SDR(B vs A), speaker 0    = 52.349 dB
+  SI-SDR(B vs A), speaker 1    = 52.516 dB
+  deformable layers with differing offsets: 24/24
+  max |offset difference| over all layers : 3.946586e-02
