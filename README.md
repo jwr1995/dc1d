@@ -9,7 +9,7 @@ The motivation for creating this toolkit is that (as of 19/10/2022) there is no 
 ## Requirements
 
 * Python >= 3.10
-* PyTorch >= 2.4 (installed automatically as a dependency)
+* PyTorch >= 2.7 (installed automatically as a dependency)
 
 `torchvision` is **not** required. Earlier releases imported private torchvision
 symbols at module scope for a dead code path; that path has been removed.
@@ -117,6 +117,51 @@ y = model(torch.rand(4, 64, 256))
 # y, offsets = model(x, with_offsets=True)  # if you want the offsets too
 ```
 
+### Modulation (DCNv2)
+
+Both layers accept the modulation of [Zhu et al. 2019](https://arxiv.org/abs/1811.11168),
+which weights each sampled position by a learned scalar as well as moving it.
+Pass `mask` alongside `offsets`, with the same shape:
+
+```python
+from dc1d.nn import DeformConv1d
+
+model = DeformConv1d(in_channels=64, out_channels=64, kernel_size=3, padding="same")
+y = model(x, offsets, mask=mask.sigmoid())
+```
+
+The mask is applied **as given**, matching `torchvision.ops.deform_conv2d`: if
+you want the `[0, 1]` modulation of the paper, apply the sigmoid yourself. An
+all-ones mask is bit-for-bit identical to passing no mask at all.
+
+`PackedDeformConv1d(..., modulated=True)` predicts the mask for you, from a
+second pointwise branch off the same depthwise trunk that produces the offsets,
+ending in a sigmoid. The final projection is zero-initialised, so every tap
+starts at exactly 0.5 and the layer has to learn to gate; note this halves the
+output scale at initialisation relative to `modulated=False`. With
+`with_offsets=True` the layer then returns `(y, (offsets, mask))` rather than
+`(y, offsets)`. The default is `modulated=False`, which is unchanged DCNv1 and
+adds no parameters.
+
+### ONNX export
+
+Both layers export to ONNX through the dynamo exporter with no custom operators,
+and the exported graph is length-agnostic:
+
+```python
+torch.onnx.export(
+    model,
+    (x,),
+    "model.onnx",
+    dynamic_shapes={"input": {2: torch.export.Dim.AUTO}},
+    dynamo=True,
+)
+```
+
+Export at one length and run at any other. `tests/test_export.py` checks this
+against `onnxruntime` from 120 to 1600 samples for a model exported at 200, and
+requires the `export` dependency group (`uv sync --group export`).
+
 ### Going faster, and using less memory
 
 Nothing below changes what the layer returns — the forward stays bit-for-bit
@@ -129,9 +174,10 @@ the forward and **1.2–2.1×** on forward+backward on an RTX 3090. Note that ev
 distinct sequence length is a separate compilation (~0.3 s), which matters for
 variable-length audio.
 
-**Then trade a little backward latency for a lot of memory.** The default
-backward keeps ~7× the sampled tensor alive between the forward and the
-backward. An alternative backward keeps ~1×:
+**Then, if you use depthwise offsets, trade a little backward latency for a lot
+of memory.** The default backward keeps ~3× the sampled tensor alive between the
+forward and the backward, or ~8.5× when `offset_groups == in_channels`. An
+alternative backward keeps ~1×:
 
 ```python
 import functools
@@ -147,11 +193,22 @@ model = DeformConv1d(
 )
 ```
 
-Measured: **1.6–2.1× lower peak memory** in eager mode for **10–23% slower**
-forward+backward, and under `torch.compile` it is **both** 0–12% faster *and*
-1.3–1.9× smaller — so if you compile, there is no reason not to use it. Full
-numbers, including why the hand-written backward does *not* make eager faster,
-are in [`benchmarks/BACKENDS.md`](benchmarks/BACKENDS.md) §5.9.
+How much this is worth depends on `offset_groups`, and the answer changed in
+2026-08 when the default gather was rewritten for ONNX correctness and took most
+of the saving with it:
+
+| | `offset_groups < in_channels` | `offset_groups == in_channels` |
+|---|---|---|
+| what the default already holds | ~3× the sampled tensor | ~8.5× |
+| `recompute` peak memory, eager | ~1.3× lower | **1.6–2.1× lower** |
+| cost, eager forward+backward | 10–23% slower | 10–23% slower |
+
+So `recompute` is clearly worth it for depthwise offsets, which is the
+configuration the DTCN paper uses, and marginal otherwise. Under
+`torch.compile` it is **both** 0–12% faster *and* smaller, so if you compile
+there is no reason not to use it. Full numbers, including why the hand-written
+backward does *not* make eager faster, are in
+[`benchmarks/BACKENDS.md`](benchmarks/BACKENDS.md) §5.9 and §5.9.4a.
 
 ### Examples and benchmarks
 

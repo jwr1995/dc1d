@@ -60,6 +60,29 @@ jobs:
       - name: pytest
         run: uv run --python ${{ matrix.python-version }} pytest -q
 
+  # ONNX export, on one Python version only. `onnx` + `onnxruntime` +
+  # `onnxscript` are a heavy install and the defect they guard against (a
+  # baked export-time length; see tests/test_export.py) is in torch's ONNX
+  # lowering, not in anything Python-version specific. Without this job the
+  # tests would `importorskip` their way to green in the matrix above and
+  # protect nothing.
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync
+        run: uv sync --locked --group export
+
+      - name: pytest (export)
+        run: uv run --group export pytest tests/test_export.py -q
+
   build:
     runs-on: ubuntu-latest
     steps:

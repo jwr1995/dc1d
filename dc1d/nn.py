@@ -191,6 +191,8 @@ class DeformConv1d(nn.Module):
             self.padding_mode = "zeros"
         if not hasattr(self, "unconstrained"):
             self.unconstrained = False
+        if not hasattr(self, "modulated"):
+            self.modulated = False
 
     def _pad(self, input: Tensor) -> Tensor:
         if self.padding_mode != "zeros":
@@ -208,7 +210,7 @@ class DeformConv1d(nn.Module):
         self,
         input: Tensor,
         offsets: Tensor,
-        mask: Tensor | None = None,  # TODO
+        mask: Tensor | None = None,
     ) -> Tensor:
         """
         Forward pass of 1D deformable convolution layer
@@ -218,14 +220,22 @@ class DeformConv1d(nn.Module):
             offsets (Tensor[batch_size, offset_groups, output_length, kernel_size]):
                 offsets to be applied for each position in the convolution kernel.
                 ``offset_groups`` may be 1 or any divisor of ``in_channels``.
-            mask (Tensor[batch_size, offset_groups, kernel_width, 1, out_width]):
-                To be implemented
+            mask (Tensor[batch_size, offset_groups, output_length, kernel_size]):
+                Optional modulation scalars, one per sampled position: this is the
+                *v2* of Zhu et al. 2019 (DCNv2), which weights each tap by a
+                learned scalar as well as moving it. Same shape as ``offsets``.
+                Applied **as given**, exactly as ``torchvision.ops.deform_conv2d``
+                does: if you want the ``[0, 1]`` modulation of the paper, pass
+                ``mask.sigmoid()``. ``None`` (default) is plain DCNv1.
 
         Returns:
             output (Tensor[batch_size, out_channels, output_length]): output tensor
         """
-        if mask is not None:
-            raise NotImplementedError("masked (deformable v2) convolution is not implemented")
+        if mask is not None and mask.shape != offsets.shape:
+            raise ValueError(
+                f"mask shape {tuple(mask.shape)} must match offsets shape "
+                f"{tuple(offsets.shape)} (batch, offset_groups, output_length, kernel_size)"
+            )
 
         in_shape = input.shape
         input = self._pad(input)
@@ -252,6 +262,17 @@ class DeformConv1d(nn.Module):
             device=input.device,
             unconstrained=self.unconstrained,
         )
+
+        # Modulation (DCNv2). The interpolated tensor is
+        # (batch, in_channels, output_length, kernel_size) and its channel axis
+        # runs as (offset_groups, channels_per_group) -- the same split the
+        # interpolation kernel gathers under -- so unflattening it lines each
+        # group's channels up against that group's mask.
+        if mask is not None:
+            input = (
+                input.unflatten(1, (mask.shape[1], -1)) * mask.unsqueeze(2).to(input.dtype)
+            ).flatten(1, 2)
+
         input = input.flatten(-2, -1)
         output = F.conv1d(
             input,
@@ -284,6 +305,7 @@ class PackedDeformConv1d(DeformConv1d):
         device: torch.device | str | None = None,
         interpolation_function: Callable = efficient_linterpolate,
         unconstrained: bool | None = None,  # default None to maintain backwards compatibility
+        modulated: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -307,6 +329,12 @@ class PackedDeformConv1d(DeformConv1d):
             device: Optional device to move the layer to on construction.
             interpolation_function (Callable): Interpolation kernel from dc1d.ops.
             unconstrained (bool): See DeformConv1d.
+            modulated (bool): Predict a DCNv2 modulation mask alongside the
+                offsets. Default False, which is plain DCNv1 and leaves the
+                parameter count unchanged. The mask head is a second pointwise
+                branch off the shared depthwise trunk, structurally identical to
+                the offset head, ending in a sigmoid so the mask lands in
+                ``(0, 1)`` as in Zhu et al. 2019.
         """
         if offset_groups <= 0 or in_channels % offset_groups != 0:
             raise ValueError(
@@ -354,8 +382,26 @@ class PackedDeformConv1d(DeformConv1d):
         self.odp_norm = gLN(kernel_size * offset_groups)
         self.odp_prelu = nn.PReLU()
 
+        self.modulated = bool(modulated)
+        if self.modulated:
+            self.mask_pconv = nn.Conv1d(
+                in_channels, kernel_size * offset_groups, 1, stride=1, bias=False
+            )
+            self.mdp_norm = gLN(kernel_size * offset_groups)
+            self.mdp_prelu = nn.PReLU()
+            # Zero the last projection so every tap starts at sigmoid(0) == 0.5,
+            # uniformly. This is the DCNv2 reference initialisation: the mask
+            # starts uninformative and the layer has to learn to gate. Note it
+            # halves the output scale at initialisation relative to modulated=False.
+            init.zeros_(self.mask_pconv.weight)
+
         if device is not None:
             self.to(device)
+
+    def _to_offset_layout(self, y: Tensor) -> Tensor:
+        """(B, kernel_size*offset_groups, L) -> (B, offset_groups, L, kernel_size)."""
+        chunks = y.unsqueeze(0).chunk(self.offset_groups, dim=2)
+        return torch.vstack(chunks).moveaxis((0, 2), (1, 3))
 
     def forward(self, input: Tensor, with_offsets: bool = False):
         """
@@ -363,27 +409,57 @@ class PackedDeformConv1d(DeformConv1d):
 
         Args:
             input (Tensor[batch_size, in_channels, length]): input tensor
-            with_offsets (bool): also return the computed offsets
+            with_offsets (bool): also return the computed offsets. When
+                ``modulated=True`` the return is
+                ``(output, (offsets, mask))`` rather than ``(output, offsets)``.
 
         Returns:
             output (Tensor[batch_size, out_channels, output_length]): output tensor
         """
-        offsets = self.offset_dconv(input)
-        offsets = self.odc_norm(self.odc_prelu(offsets).moveaxis(1, 2)).moveaxis(2, 1)
+        trunk = self.offset_dconv(input)
+        trunk = self.odc_norm(self.odc_prelu(trunk).moveaxis(1, 2)).moveaxis(2, 1)
 
-        offsets = self.offset_pconv(offsets)
+        offsets = self.offset_pconv(trunk)
         # batch_size x (kernel_size*offset_groups) x length
         offsets = self.odp_norm(self.odp_prelu(offsets).moveaxis(1, 2)).moveaxis(2, 1)
-        offsets = offsets.unsqueeze(0).chunk(self.offset_groups, dim=2)
         # batch_size x offset_groups x length x kernel_size
-        offsets = torch.vstack(offsets).moveaxis((0, 2), (1, 3))
+        offsets = self._to_offset_layout(offsets)
 
+        mask = None
+        if self.modulated:
+            mask = self.mask_pconv(trunk)
+            mask = self.mdp_norm(self.mdp_prelu(mask).moveaxis(1, 2)).moveaxis(2, 1)
+            # Sigmoid here, not in DeformConv1d.forward: the base layer applies a
+            # caller-supplied mask verbatim (torchvision's contract), so the
+            # squashing belongs to whoever predicts the mask.
+            mask = self._to_offset_layout(mask).sigmoid()
+
+        output = super().forward(input, offsets, mask)
         if with_offsets:
-            return super().forward(input, offsets), offsets
-        return super().forward(input, offsets)
+            return output, (offsets, mask) if self.modulated else offsets
+        return output
 
 
 EPS = 1e-9
+
+
+def _rms(var: Tensor) -> Tensor:
+    """
+    ``sqrt(var)``, floored so that a zero-variance input cannot divide by zero.
+
+    Written as ``clamp_min`` rather than the usual ``var + EPS`` because the
+    ONNX exporter **deletes** a sufficiently small additive constant: measured
+    2026-08, ``Add(var, 1e-9)`` and ``Add(var, 1e-8)`` are both folded out of
+    the graph (``1e-5`` survives), leaving ``Div(x, Pow(var, 0.5))``. On a
+    constant input that is ``0 / 0``, so the exported model returns NaN where
+    eager PyTorch returns zeros, silently. Rewriting the square root as ``sqrt``
+    or ``rsqrt`` does not help; the additive term is what gets dropped.
+
+    ``clamp_min`` survives export at any magnitude, and for any non-degenerate
+    input it is a closer match to eager than the addition was: it is a no-op
+    wherever ``var > EPS``, whereas the addition perturbs every value.
+    """
+    return torch.pow(torch.clamp_min(var, EPS), 0.5)
 
 
 class gLN(nn.Module):
@@ -430,7 +506,7 @@ class gLN(nn.Module):
         """
         mean = y.mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)  # [M, 1, 1]
         var = (torch.pow(y - mean, 2)).mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)
-        gLN_y = self.gamma * (y - mean) / torch.pow(var + EPS, 0.5) + self.beta
+        gLN_y = self.gamma * (y - mean) / _rms(var) + self.beta
         return gLN_y
 
 
@@ -471,7 +547,7 @@ class cLN(nn.Module):
         """
         mean = torch.mean(y, dim=2, keepdim=True)  # [M, K, 1]
         var = torch.var(y, dim=2, keepdim=True, unbiased=False)  # [M, K, 1]
-        cLN_y = self.gamma * (y - mean) / torch.pow(var + EPS, 0.5) + self.beta
+        cLN_y = self.gamma * (y - mean) / _rms(var) + self.beta
         return cLN_y
 
 

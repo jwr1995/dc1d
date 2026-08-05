@@ -40,6 +40,111 @@ Environment used for verification: `uv` 0.11.32, CPython 3.12.13,
       dev group, get a clean run, then add `dc1d/py.typed` and
       `[tool.hatch.build.targets.wheel] force-include`.
 
+## Export and modulation (2026-08 pass)
+
+Verified on `torch 2.13.0+cpu`, `onnx 1.22.0`, `onnxruntime 1.28.0`,
+`onnxscript 0.7.1`. Everything below was reproduced before being changed.
+
+- [x] **E1 — `take_along_dim` silently breaks dynamic-length ONNX.** It decomposes
+      to a negative-index wrap `index % self.size(dim)`, and the exporter
+      constant-folds the modulus against the export-time length: the graph for a
+      model exported at `L=200` contains a literal `Mod(index, 200)`.
+      Reproduced: max abs error **2.4e-07** at `T=200`, **3.4e+00** at `T=300`,
+      **3.8e+00** at `T=1600`, with the correct output shape throughout and no
+      error raised. Note `T=120` is also correct, because indices below the baked
+      modulus do not wrap — so a test at a single length can pass either side of
+      the bug. Fixed by gathering with `torch.gather` on an explicitly `expand`ed
+      index (`dc1d/ops.py:_gather_pair`); bit-identical in eager at fp32 and
+      fp64, and the graph loses the `Mod` entirely (47 → 44 nodes).
+- [x] **E2 — modulation (DCNv2) implemented.** `DeformConv1d.forward` raised
+      `NotImplementedError` on `mask is not None`. The mask now multiplies the
+      sampled positions before the contraction, applied verbatim as
+      `torchvision.ops.deform_conv2d` does. `PackedDeformConv1d(modulated=True)`
+      predicts it from a second pointwise branch off the shared depthwise trunk.
+      Default is off, so parameter counts and outputs are unchanged.
+      `tests/test_modulation.py`.
+- [x] **E3 — gLN/cLN dropped their epsilon under ONNX export, giving NaN.**
+      Found while testing E2, and independent of it. The exporter folds away
+      `Add(var, 1e-9)` (and `1e-8`; `1e-5` survives), leaving `Div(x, Pow(var, 0.5))`,
+      so a zero-variance input divides 0 by 0: onnxruntime returns NaN where
+      eager returns zeros. Rewriting as `sqrt` or `rsqrt` does not help, the
+      *additive* term is what is dropped. Fixed with `clamp_min` (`dc1d/nn.py:_rms`),
+      which survives export and is a no-op wherever `var > EPS` — so it is a
+      closer match to eager than the addition was, not merely a safer one.
+      `PackedDeformConv1d(modulated=True)` hits this deterministically, because
+      the zero-initialised mask projection makes the tensor reaching gLN exactly
+      constant at initialisation.
+- [ ] **E4 — `torch.compiler.is_exporting()` guard on the offset-count assertion:
+      NOT APPLIED, could not reproduce a problem.** The claim was that
+      `offsets.shape[-2] != expected` specialises the offset length under trace.
+      Measured on torch 2.13: exported programs generalise exactly (zero error)
+      at `T` in {120, 200, 201, 202, 203, 300, 303, 777, 1600, 1601} for
+      `stride` in {1, 2, 3} and `dilation` in {1, 2, 4}, under both
+      `strict=True` and `strict=False`, including lengths whose floor-division
+      remainder differs from the export length's. Declaring the input and offset
+      axes as *independent* named `Dim`s does fail, but the solver's own message
+      is a range refinement (`Suggested fixes: Lo = Dim('Lo', min=7, max=49999)`),
+      not a specialisation — and those two axes genuinely are dependent, so
+      failing is correct. Guarding the check would remove the validation that
+      `CLAUDE.md` calls load-bearing in exchange for nothing. Revisit if a
+      reproducer on a specific torch version appears.
+- [ ] **E5 — tail reshape blocking a named `torch.export.Dim`: NOT APPLIED,
+      could not reproduce.** Named `Dim`s export cleanly through both
+      `torch.export.export` and `torch.onnx.export`, for `DeformConv1d` at
+      `stride` in {1, 2} and for `PackedDeformConv1d` including `modulated=True`.
+      No `Mod(K*To, To)` guard was raised. `tests/test_export.py::test_torch_export_accepts_a_named_dim`
+      pins this so a future regression is visible.
+- [x] **E8 — E1 is a torch regression, first shipped in 2.10.0.** Bisected across
+      CPU wheels with one harness, `take_along_dim` held constant:
+
+      | torch | constant `Mod` | T=300 error | nodes |
+      |---|---|---|---|
+      | 2.7.1 | none | 1.8e-07 | 45 |
+      | 2.8.0 | none | 1.8e-07 | 45 |
+      | 2.9.1 | none | 1.8e-07 | 45 |
+      | 2.10.0 | `[200, 200]` | **2.6e+00** | 47 |
+      | 2.11.0 | `[200, 200]` | **2.6e+00** | 47 |
+      | 2.12.1 | `[200, 200]` | **2.6e+00** | 47 |
+      | 2.13.0 | `[200]` | **3.4e+00** | 47 |
+
+      The shipped `gather` build is 44 nodes with no `Mod` and ~1.8e-07 on
+      **every** version. Consequences: (a) anyone who validated an ONNX export
+      before 2.10 and later upgraded acquired the bug silently, which is the
+      most likely way this reached production unnoticed; (b) E3 is **not** a
+      regression, the gLN epsilon is dropped on all seven versions; (c) E4/E5
+      fail to reproduce on all seven, which is much stronger evidence for not
+      applying those patches than torch 2.13 alone was.
+- [x] **E9 — minimum torch raised `>=2.4` to `>=2.7`** (`pyproject.toml`), and
+      `__version__` `0.1.0` to `0.2.0`. 2.7 is the oldest release the export
+      path is verified against; 2.4 to 2.6 were never tested and are not
+      claimed. Nothing in the layer needs a 2.7 API, so older torch will still
+      import and run; only `tests/test_export.py` is unverified there.
+      Full suite green on 2.7.1: 403 passed, 72 skipped, identical to 2.13.
+- [x] **E6 — re-measured the memory consequences of E1** (`BACKENDS.md` section
+      5.9.4a, A100, contended GPU so latency is indicative and memory is not).
+      `gather` on an expanded index saves the stride-0 *view* on the tape
+      (`_saved_index` stride `(3066, 3066, 0, 1)`, 0.094 MiB) where
+      `take_along_dim` saved a materialised copy (`(196224, 196224, 3066, 1)`,
+      5.988 MiB). The default `autograd` tape drops from **7.02x the output to
+      3.0-3.4x**, and peak fwd+bwd by **1.5-1.6x** eager and **2.2-2.5x**
+      compiled, but **only when `offset_groups < channels`**; at
+      `offset_groups == channels` the expand is an identity and only a forward
+      transient improves (1.24x eager, nothing compiled). Forward parity
+      re-verified `torch.equal` 27/27.
+- [x] **E7 — corrected the stale `recompute` ratios** in `CLAUDE.md`,
+      `README.md` and the `gather_lerp` docstring. Its advantage over the *new*
+      default is **1.30x**, not 1.6-2.1x, for `offset_groups < channels`; it
+      keeps the full 1.6-2.1x at `offset_groups == channels`, which is the
+      depthwise case the DTCN paper uses. `save-diff` and `recompute` are
+      themselves unchanged by E1 (18/18 rows within 0.2 MiB).
+- [ ] The 6.6x CPU figure that prompted E1 is real but was a single shape.
+      Whole-layer CPU forward is **1.15x to 4.53x** and forward+backward
+      **1.15x to 1.85x**; depthwise configurations gain ~1.05x. Do not quote a
+      single number.
+- [ ] Re-run section 5.9.4a on an **idle** GPU, and on the 3090 the rest of
+      `BACKENDS.md` uses, before treating its latency columns as anything but
+      indicative.
+
 ## Correctness
 
 Every item below was **reproduced against the pre-change code** (extracted with
