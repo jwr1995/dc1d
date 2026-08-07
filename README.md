@@ -21,6 +21,10 @@ build: https://pytorch.org/get-started/locally/.
 
 *N.B. for the version we released for our paper, stick to `dc1d==0.0.6` or lower*
 
+[`CHANGELOG.md`](CHANGELOG.md) records what changed since, including why a
+0.0.x `PackedDeformConv1d` checkpoint will load without complaint and then
+behave differently.
+
 ```
 pip install dc1d
 ```

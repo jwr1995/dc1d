@@ -677,11 +677,17 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       `.disabled`; a tag push is only a trigger going forward. The long-form notes
       for it were written to `~/dc1d-release-notes.md`, which is **outside the
       repository**: see the CHANGELOG item below.
-- [ ] **Consider a `CHANGELOG.md`.** Right now the release body comes from the tag
-      message, so anything longer than a tag message (the v0.2.0 notes are 11.7 KB,
-      covering 55 commits back to v0.0.6) has nowhere in-repo to live. Either keep
-      tag messages short and accept that, or add a CHANGELOG and point the workflow
-      at the relevant section instead. Not decided.
+- [x] **`CHANGELOG.md` added, and the workflow reads it.** Settled the open
+      question: the release body is the `## [x.y.z]` section for the tag, falling
+      back to the annotated tag's message, then to `--generate-notes`. So notes are
+      reviewed in a PR rather than typed into a web form, and a tag message can stay
+      short. Extraction verified locally against the real file: 183 lines for
+      `0.2.0`, empty for an absent version, and `0.2.0-rc1` does not match
+      `[0.2.0]`.
+- [ ] **The `[Unreleased]` section has to be kept current by hand.** Nothing checks
+      that a tag has a matching section; a missing one degrades to the tag message
+      instead of failing. Consider making the build job fail when
+      `CHANGELOG.md` has no section for the tag being built.
 - [ ] **Nothing has been published to PyPI, and the publish job cannot succeed
       until the two items below are done.** That is exactly why a tag push does
       *not* trigger it and `workflow_dispatch` does. PyPI still serves `0.0.7`
