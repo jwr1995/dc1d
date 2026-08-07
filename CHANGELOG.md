@@ -7,7 +7,8 @@ uses it as the GitHub Release body, so the heading format is load-bearing:
 `## [x.y.z] - YYYY-MM-DD`, one blank line, then the section. A version with no
 section here falls back to the annotated tag's message.
 
-Versions before 0.2.0 were never tagged; 0.0.7 is what PyPI still serves.
+0.0.7 and 0.1.0 were never tagged; the previous tag is `v0.0.6`. PyPI carries
+0.0.2, 0.0.4, 0.0.7 (yanked) and 0.2.0.
 
 ## [Unreleased]
 
@@ -33,7 +34,7 @@ backends, and no torchvision dependency at all.
   warning, then predicts entirely different offsets. **The DTCN paper's
   configuration is affected** (dilations 1 to 128): same weights, same input, the
   separated waveforms from 0.0.7 and 0.2.0 agree to only **4.84 dB SI-SDR**.
-  Reproducing the published model requires pinning `dc1d==0.0.6` or lower. It is
+  Reproducing the published model requires pinning `dc1d==0.0.4` or lower. It is
   simultaneously a bug fix: the old wiring dropped stride and dilation from the
   offset convolution, and with `stride > 1` returned an output of the wrong
   length. Full measurement in `EQUIVALENCE.md` R1.
@@ -177,8 +178,9 @@ Two more found while adding export support:
 
 ### Known limits
 
-- **Not published to PyPI.** `pip install dc1d` still gets 0.0.7. The publish job
-  needs a Trusted Publisher that does not exist yet; see `TODO.md`.
+- **0.0.6 was never published to PyPI**, so the paper pin is `dc1d==0.0.4`, the
+  newest release predating the offset-convolution rewiring. 0.0.7 is yanked and
+  installs only when pinned exactly.
 - No version-guarded shim or `load_state_dict` hook warns about the checkpoint
   break above. It is documented only.
 - `BACKENDS.md` section 5.9.4a came off a contended A100 rather than the idle
@@ -203,12 +205,15 @@ Bumped in-repo, never tagged and never published. Folded into 0.2.0 above.
 
 ## [0.0.7] - 2022
 
-The version PyPI currently serves. README fixes and bug fixes on top of 0.0.6.
+README fixes and bug fixes on top of 0.0.6. Yanked on PyPI, so it installs only
+when pinned exactly, which is why the paper pin above is 0.0.4 rather than 0.0.7.
 
 ## [0.0.6] - 2022
 
-**The version the ICASSP 2023 DTCN paper was built against.** Pin `dc1d==0.0.6`
-or lower to reproduce it; see the checkpoint note under 0.2.0 for why.
+**The version the ICASSP 2023 DTCN paper was built against.** It was tagged but
+never published, so pin `dc1d==0.0.4` or lower to reproduce it: 0.0.4 is the
+newest release on PyPI from before the offset-convolution rewiring. See the
+checkpoint note under 0.2.0 for why the pin matters.
 
 [Unreleased]: https://github.com/jwr1995/dc1d/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/jwr1995/dc1d/compare/v0.0.6...v0.2.0
