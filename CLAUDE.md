@@ -1,6 +1,6 @@
 # dc1d
 
-Pure-PyTorch 1D deformable convolution (Dai et al. 2017, DCNv1, no modulation mask). Backs the ICASSP 2023 paper *Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation*.
+Pure-PyTorch 1D deformable convolution (Dai et al. 2017): DCNv1 by default, with opt-in DCNv2 modulation (Zhu et al. 2019) since 0.2.0. Backs the ICASSP 2023 paper *Deformable Temporal Convolutional Networks for Monaural Noisy Reverberant Speech Separation*.
 
 The selling point is that it needs **no C++/CUDA compilation**: everything rides on `torch.autograd`. Preserve that property. Any proposal that requires a build step (custom CUDA, Triton kernels shipped as source) must be justified against it explicitly.
 
@@ -26,12 +26,12 @@ The same applies to commit messages: a short imperative subject, then bullets or
 
 Use `uv` for everything: `uv run pytest`, `uv run ruff check`, `uv sync`. Do not call `pip` or a bare `python`. The dev environment pins Python 3.12 and CPU-only torch; the published wheel requires `torch>=2.7` on any supported Python (raised from 2.4 in 0.2.0: 2.7 is the oldest release the ONNX export path is verified against).
 
-Before pushing: `uv run ruff check && uv run ruff format --check && uv run pytest`. CI runs the same across 3.10 to 3.13.
+Before pushing: `uv run ruff check && uv run ruff format --check && uv run pytest`. CI lints once and runs `pytest` across 3.10 to 3.13, plus a separate ONNX-export job.
 
 ## Layout
 
 - `dc1d/ops.py`: interpolation kernels. `efficient_linterpolate` is the default and the only one that matters; `kernel_width_linterpolate` and `full_seq_linterpolate` are kept for reference and are memory-explosive by design.
-- `dc1d/nn.py`: `DeformConv1d` (caller supplies offsets) and `PackedDeformConv1d` (predicts offsets internally via depthwise, gLN, PReLU, pointwise, gLN, PReLU).
+- `dc1d/nn.py`: `DeformConv1d` (caller supplies offsets) and `PackedDeformConv1d` (predicts offsets internally via depthwise, PReLU, gLN, pointwise, PReLU, gLN, plus a parallel mask branch when `modulated=True`).
 - `tests/`: see below; these are load-bearing.
 - `benchmarks/benchmark.py`: `torch.utils.benchmark.Timer`, forward and forward+backward timed separately.
 - `docs/demo.ipynb`: the visual walkthrough, committed **with outputs** so it renders on GitHub, plus `docs/demo/*.png` which the notebook writes itself. Every property it shows is `assert`ed, so it is documentation and a slow test at once. It needs the `demo` dependency group, is CPU-only, and must stay under ten seconds. After any change that alters its numbers or figures, re-run `uv run --group demo jupyter nbconvert --to notebook --execute --inplace docs/demo.ipynb` and commit the regenerated outputs and PNGs. Ruff lints and formats notebook cells, so run `uv run ruff format docs/demo.ipynb` before re-executing, not after.
@@ -53,7 +53,7 @@ These are all fixed. They are listed because the same classes of bug are easy to
 - **The index clamp hides shape bugs.** `efficient_linterpolate` clamps out-of-range positions, so a wrong `L_out` produces plausible wrong-length output rather than an exception. `DeformConv1d.forward` therefore validates `offsets.shape[-2]` against input length, stride, dilation and padding. Keep that check.
 - **`torch.gather` does not broadcast; `take_along_dim` does.** What matters is that the index is never *tiled* to the channel count. `take_along_dim` gets that by broadcasting; `gather` gets it from an explicit `expand`, which is a stride-0 view that the strided iterator reads for free. Both are fine. Materialising a channel-sized int64 index is what is not. Note the ordering trap in `_gather_pair`: `(idx + 1).expand(...)`, never `idx.expand(...) + 1`, or the arithmetic materialises the thing the expand was avoiding.
 
-  **`take_along_dim` is nevertheless banned here, because it does not survive ONNX export from torch 2.10 onwards.** It decomposes to a negative-index wrap, `index % self.size(dim)`, and the exporter constant-folds that modulus against the *export-time* length: a model exported at `L = 200` gets a literal `Mod(index, 200)` in its graph. Bisected across CPU wheels: **clean on 2.7, 2.8, 2.9; broken on 2.10, 2.11, 2.12, 2.13**. It is a torch regression, not a property of the operator, so do not restore `take_along_dim` on the grounds that some older torch exports it correctly. Longer inputs then wrap around and read the wrong samples, at full signal magnitude, with the correct output shape and no error raised (measured 2026-08: 3.6e-06 max abs error at `T = 200`, 3.4e+00 at `T = 300`). A shape assertion cannot see it, and neither can a numerical test at a single length, because the convenient length to test at is the export length, which is the one length where it is invisible. `tests/test_export.py` therefore sweeps lengths on both sides of the export length and separately asserts that no constant-divisor `Mod` appears in the graph at all. `gather` accepts no negative indices, emits no `Mod`, and is bit-identical in eager.
+  **`take_along_dim` is nevertheless banned here, because it does not survive ONNX export from torch 2.10 onwards.** It decomposes to a negative-index wrap, `index % self.size(dim)`, and the exporter constant-folds that modulus against the *export-time* length: a model exported at `L = 200` gets a literal `Mod(index, 200)` in its graph. Bisected across CPU wheels: **clean on 2.7, 2.8, 2.9; broken on 2.10, 2.11, 2.12, 2.13**. It is a torch regression, not a property of the operator, so do not restore `take_along_dim` on the grounds that some older torch exports it correctly. Longer inputs then wrap around and read the wrong samples, at full signal magnitude, with the correct output shape and no error raised (at the export length the broken build is still correct to the ordinary fp32 export tolerance, ~2e-07; at `T = 300` it is 3.4e+00 on torch 2.13. Per-version table: `TODO.md` E8). A shape assertion cannot see it, and neither can a numerical test at a single length, because the convenient length to test at is the export length, which is the one length where it is invisible. `tests/test_export.py` therefore sweeps lengths on both sides of the export length and separately asserts that no constant-divisor `Mod` appears in the graph at all. `gather` accepts no negative indices, emits no `Mod`, and is bit-identical in eager.
 
   **A separate allocation was still there on the backward side, unnoticed until 2026-07.** `take_along_dim` broadcasts for the forward, but its *backward* saved the broadcast index **materialised**, 8 bytes per output element, twice: the default backward held **7.02x the output tensor** between forward and backward, against **1.03x** for `gather_lerp='recompute'`. When looking for memory, look at what autograd saves, not only at what the forward allocates.
 
@@ -67,7 +67,7 @@ These are all fixed. They are listed because the same classes of bug are easy to
 
 Two separate sets of numbers exist; do not confuse them.
 
-- **`benchmarks/benchmark.py`** compares old-dc1d against new-dc1d, and has only ever run on **CPU**, because the default dev environment is CPU-only torch. Its figures (2.8x to 3.4x forward, 3.5x to 4.4x fwd+bwd, 283 to 91 MiB peak RSS) are CPU wall-clock and CPU RSS. The GPU equivalent of *that* comparison is still unmeasured.
+- **`benchmarks/benchmark.py`** compares dc1d against `nn.Conv1d`, forward and forward+backward, and prints peak memory only on CUDA. It has only ever been *run* on CPU, because the default dev environment is CPU-only torch. It does **not** measure old-dc1d against new-dc1d: those figures (2.8x to 3.4x forward, 3.5x to 4.4x fwd+bwd, 283 to 91 MiB peak RSS, CPU wall-clock and CPU RSS) are in `TODO.md` under Benchmarks, and came from an ad-hoc harness that is not in the tree, so they cannot be reproduced from a clean clone. The GPU equivalent of that comparison is still unmeasured.
 - **`benchmarks/BACKENDS.md`** compares dc1d against three other backends on **CUDA** (3090), eager and compiled, with peak `max_memory_allocated`. Those are real GPU numbers.
 
 Profiled launch counts, since the estimate was wrong and is still quoted in older commit messages: the rewrite moved the interpolation from **26 to 23** kernels, a 12% cut, not the 5x that was projected. Its win was memory and correctness. `torch.compile` is what actually delivers the reduction (forward 27 to 4; backward only 66 to 31).
@@ -78,7 +78,7 @@ Two things a custom `autograd.Function` costs, both found by testing and both ea
 
 **Timing protocol.** `bench_compile_config` reverses the round-robin on alternate rounds. Plain round-robin controls for drift between rounds but not within one, so whatever is measured last is penalised in *every* round, and min-across-rounds cannot remove that. Do not "simplify" it back.
 
-Dynamic shapes are unavailable: `mark_dynamic` on the length axis raises `ConstraintViolationError` because the graph specialises on `L` (`dc1d/ops.py:184`). `dynamic=True` does not raise only because it specialises silently, giving one graph per distinct length plus a slower steady state for asking. For variable-length speech that is roughly 0.3 s of compile per new length.
+Dynamic shapes are unavailable: `mark_dynamic` on the length axis raises `ConstraintViolationError` because the graph specialises on `L` at the `out_length * kernel_size` reshape in `efficient_linterpolate`. `dynamic=True` does not raise only because it specialises silently, giving one graph per distinct length plus a slower steady state for asking. For variable-length speech that is roughly 0.3 s of compile per new length.
 
 Always `torch.cuda.synchronize()` around GPU timing, or use `torch.utils.benchmark`. Give both sides of any comparison the same warmup. An earlier benchmark gave the deformable path three warmup iterations against a vanilla conv's one cold call, including cuDNN algorithm selection.
 

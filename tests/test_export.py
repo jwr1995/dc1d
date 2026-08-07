@@ -9,7 +9,9 @@ at L = 200 then emitted a literal `Mod(index, 200)`, so every input longer than
 200 wrapped around and read the wrong samples. It produced the right output
 shape, raised nothing, and was wrong by the magnitude of the signal.
 
-Bisected: clean on torch 2.7-2.9, broken on 2.10-2.13. A regression, which means
+Bisected across CPU wheels with `take_along_dim` held constant: clean on torch
+2.7-2.9, broken on 2.10-2.13 (per-version table in `TODO.md` E8). A regression,
+which means
 an export validated before 2.10 would have started returning wrong numbers on
 upgrade with nothing to indicate it.
 

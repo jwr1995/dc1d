@@ -1,8 +1,9 @@
 # dc1d modernisation TODO
 
-Tracking document for the 2026-07 modernisation pass. Everything below was left
-in the working tree — nothing has been committed, branched or pushed. Review
-with `git diff` / `git status`.
+Tracking document for the 2026-07 modernisation pass and the 2026-08 export and
+modulation pass. All of it is now committed and merged; `v0.2.0` is tagged and
+published. Unticked items below are genuinely outstanding, not unreviewed work.
+Review with `git log v0.0.6..` rather than `git diff`.
 
 Environment used for verification: `uv` 0.11.32, CPython 3.12.13,
 `torch 2.13.0+cpu`. Full suite also run green on 3.10.20, 3.11 and 3.13.14.
@@ -14,16 +15,16 @@ Environment used for verification: `uv` 0.11.32, CPython 3.12.13,
 - [x] Migrate to a `uv`-managed project: `pyproject.toml` + `uv.lock` + `.python-version` (3.12).
 - [x] **Add the missing `dependencies` field.** `pyproject.toml` had none at all, so
       `pip install dc1d` produced a package that `ImportError`ed on first use.
-      Now `torch>=2.4` (`pyproject.toml:15-17`).
+      Now `torch>=2.7` (`pyproject.toml`, `dependencies`), raised from `>=2.4` by E9.
 - [x] Do **not** add `torchvision` — the only consumer was the dead `deform_conv1d`
       (see Correctness / C8 below), which is now deleted. dc1d is torchvision-free.
 - [x] `requires-python` `>=3.8` → `>=3.10`; classifiers updated for 3.10–3.13.
 - [x] Dev dependency group with `pytest` + `ruff` (`pyproject.toml:[dependency-groups]`).
 - [x] CPU-only torch for the dev venv via `[tool.uv.sources]` + `[[tool.uv.index]] pytorch-cpu`
       (explicit index, so only `torch` is pulled from it). The published wheel keeps
-      a plain `torch>=2.4`, so end users still get whatever build pip resolves.
+      a plain `torch>=2.7` (E9), so end users still get whatever build pip resolves.
 - [x] `__version__` added to `dc1d/__init__.py:15`; hatchling reads it via
-      `[tool.hatch.version] path = "dc1d/__init__.py"`. Bumped `0.0.7` → **`0.1.0`**
+      `[tool.hatch.version] path = "dc1d/__init__.py"`. Bumped `0.0.7` → `0.1.0` → **`0.2.0`** (E9)
       for the breaking changes in this pass (see Release below).
 - [x] `dc1d/__init__.py` now re-exports `DeformConv1d`, `PackedDeformConv1d`,
       `gLN`, `cLN` and the three interpolation kernels. It previously exported nothing.
@@ -34,7 +35,7 @@ Environment used for verification: `uv` 0.11.32, CPython 3.12.13,
 - [ ] **`py.typed` marker — NOT added.** The annotations on the public API are now
       correct (see C-anno below), but they are incomplete: `gLN.__init__`,
       `cLN.__init__`, `gLN.forward`, `cLN.forward` and
-      `PackedDeformConv1d.forward` (`dc1d/nn.py:360`) are unannotated, and
+      `PackedDeformConv1d.forward` (`dc1d/nn.py::PackedDeformConv1d.forward`) are unannotated, and
       `interpolation_function: Callable` is unparameterised. No type checker has
       been run against the package. **Left:** add `mypy` (or `ty`/`pyright`) to the
       dev group, get a clean run, then add `dc1d/py.typed` and
@@ -158,44 +159,46 @@ fixed. Findings that differ from the original review notes are called out.
       `python-build-standalone` bundles tkinter. It breaks on the system python
       (3.14) and on any distro python without `python3-tk`. The import was unused
       either way.
-- [x] **C2 — `extra_repr` rewritten** (`dc1d/nn.py:171-186`). Reproduced:
+- [x] **C2 — `extra_repr` rewritten** (`dc1d/nn.py::DeformConv1d.extra_repr`). Reproduced:
       `repr(model)` → `TypeError: object of type 'int' has no len()`. The old body
       was copy-pasted from `_ConvNd`, which stores padding/dilation as tuples, and
       referenced `self.output_padding`, which this class never assigns. The new
       version reads the actual scalar attributes and also surfaces `unconstrained`.
-- [x] **C3 — low-precision sampling positions fixed** (`dc1d/ops.py:130-162`).
+- [x] **C3 — low-precision sampling positions fixed** (`dc1d/ops.py::efficient_linterpolate`).
       Reproduced: with fp16 offsets and `L=16000`, **13952 of 15998** output rows
       were wrong, first divergence at row **2046**, max abs error 7.22, no NaN.
       `torch.linspace(0, 15997, 15998, dtype=float16)` yields only 5073 distinct
       values and saturates at 16000. Fixed by decomposition: the integer window
-      start is `torch.arange(Lo) * stride` in `long` (`dc1d/ops.py:140`), the
-      dilated tap offsets are `long` (`_dilated_positions_long`, `dc1d/ops.py:47`),
+      start is `torch.arange(Lo) * stride` in `long` (`dc1d/ops.py::efficient_linterpolate`), the
+      dilated tap offsets are `long` (`_dilated_positions_long`, `dc1d/ops.py::_dilated_positions_long`),
       and only the sub-sample fraction is carried in the offset dtype
-      (`dc1d/ops.py:149`). Verified: bf16 offsets (8 mantissa bits, integers exact
+      (`dc1d/ops.py::efficient_linterpolate`). Verified: bf16 offsets (8 mantissa bits, integers exact
       only to 256) still gather exactly at `L=8192`.
 - [x] **C4 — `PackedDeformConv1d` offset conv now forwards `stride` and `dilation`**
-      (`dc1d/nn.py:337-348`). Reproduced: with `stride=2, L=40` the original
+      (`dc1d/nn.py::PackedDeformConv1d.__init__`). Reproduced: with `stride=2, L=40` the original
       returned length **38** instead of 19; with `dilation=3` it returned **38**
       instead of 34, silently. The index clamp absorbed the mismatch.
 - [x] **C4b — explicit offset-shape assertion in `DeformConv1d.forward`**
-      (`dc1d/nn.py:236-243`), raising `ValueError` against the closed form
-      `output_length(padded_len, K, dilation, stride)` (`dc1d/ops.py:21`).
-      Also exposed as `DeformConv1d.expected_offset_positions()` (`dc1d/nn.py:202`)
+      (`dc1d/nn.py::DeformConv1d.forward`), raising `ValueError` against the closed form
+      `output_length(padded_len, K, dilation, stride)` (`dc1d/ops.py::output_length`).
+      Also exposed as `DeformConv1d.expected_offset_positions()` (`dc1d/nn.py::DeformConv1d.expected_offset_positions`)
       so callers can size their offset tensors without duplicating the formula.
 - [x] **C5 — `offset_groups` strictly between 1 and C** (was `dc1d/ops.py:227-228`,
       `U.repeat` tiling to `G*C` channels). Reproduced: `offset_groups=4, C=8` →
       `RuntimeError: Size does not match at dimension 1 expected index
       [2, 32, 38, 2] to be no larger than self [2, 8, 40, 2]`. The tiled index
-      tensor no longer exists at all — `take_along_dim` broadcasts, and the channel
-      axis is viewed as `(groups, channels_per_group)` (`dc1d/ops.py:180-193`),
+      tensor no longer exists at all — the gather index is broadcast rather than
+      tiled (`take_along_dim` at the time; an `expand`ed `torch.gather` since
+      2026-08), and the channel axis is viewed as `(groups, channels_per_group)`
+      (`dc1d/ops.py::_gather_pair`),
       which serves every group ratio including `1 < G < C`.
       `PackedDeformConv1d` was also relaxed from `offset_groups in {1, in_channels}`
-      to any divisor of `in_channels` (`dc1d/nn.py:312-316`), matching what the
+      to any divisor of `in_channels` (`dc1d/nn.py::PackedDeformConv1d.__init__`), matching what the
       docstring at the old `nn.py:179` had always claimed.
 - [x] **C6 — unconstrained clamp `x.shape[-1]` → `x.shape[-1]-1`.** Reproduced, and
       it is **worse than the review described**: at exactly `T == L` *both* bilinear
       weights fall to zero, so the output is exactly **0.0**, not merely attenuated.
-      Handled on the split representation at `dc1d/ops.py:151-162` (clamp the
+      Handled on the split representation at `dc1d/ops.py::efficient_linterpolate` (clamp the
       integer index to `[0, L-2]` and force the fraction to 0/1 outside the range),
       which reproduces the correct clamp gradient without ever forming a
       large-magnitude float. Guarded by `test_interpolation_weights_sum_to_one_at_right_edge`.
@@ -217,18 +220,18 @@ fixed. Findings that differ from the original review notes are called out.
       imports. It wrote into a preallocated tensor in place and could not
       participate in autograd. The remaining `_max_memory=False` loop path was
       rewritten to `torch.stack` a list instead of in-place writes, so it is now
-      differentiable too (`dc1d/ops.py:350-360`).
+      differentiable too (`dc1d/ops.py::efficient_linterpolate`).
 - [x] **`full_seq_linterpolate` `_test` NameError fixed** (was `dc1d/ops.py:81,83`).
       Reproduced: `NameError: name 'batch_size' is not defined`. Now uses `x.shape[0]`.
 - [x] **XOR bug fixed.** `dilation = 2^7` is XOR and evaluates to **5** — confirmed.
       The "large dilation" benchmark had been running dilation=5 since 2022.
-      Fixed at `dc1d/nn.py:487` (`2**7`) and `playground/param_example.py:22`
+      Fixed at `dc1d/nn.py, the `__main__` demo block` (`2**7`) and `playground/param_example.py:22`
       (`2**5`, with the channel count reduced so it stays runnable on CPU).
       Both sites carry an explanatory comment.
 - [x] `if dilated_positions == None` → `is None` (was `ops.py:45,111,196`).
 - [x] **`forward` no longer mutates `self.device`** (was `dc1d/nn.py:201-204` and
       `nn.py:314`). The device now comes from the input tensor, and
-      `dilated_positions` is a non-persistent buffer (`dc1d/nn.py:148-152`), so
+      `dilated_positions` is a non-persistent buffer (`dc1d/nn.py::DeformConv1d.__init__`), so
       `.to()`/`.cuda()` move it automatically. The `device=` constructor kwarg is
       kept for back-compat but only triggers a `self.to(device)` at the end of
       `__init__`. **The `self.device` attribute no longer exists** — this is the one
@@ -237,7 +240,7 @@ fixed. Findings that differ from the original review notes are called out.
       Verified: `torch._dynamo.explain` reports **0 graph breaks / 1 graph**, and
       `torch.compile(model, fullgraph=True, backend="aot_eager")` matches eager
       bit-for-bit and still produces offset gradients.
-- [x] **`unconstrained` is now a plain bool set unconditionally** (`dc1d/nn.py:128`).
+- [x] **`unconstrained` is now a plain bool set unconditionally** (`dc1d/nn.py::DeformConv1d.__init__`).
       The `if "unconstrained" in self.__dict__.keys()` dispatch (old `nn.py:206`,
       driven by `nn.py:132`) is gone. `__setstate__` backfills it for old pickles.
 - [x] **User-input asserts converted to exceptions** (old `ops.py:108,193`;
@@ -245,8 +248,8 @@ fixed. Findings that differ from the original review notes are called out.
       `RuntimeError` / `NotImplementedError` and survives `python -O`. The only
       remaining `assert`s are in tests and example scripts.
 - [x] **C-anno — type annotations fixed.** `padding: int = "valid"` → `int | str`
-      (`dc1d/nn.py:51`, `nn.py:278`); `unconstrained: str = None` → `bool | None`
-      (`dc1d/nn.py:58`, `nn.py:286`); `mask: Optional[Tensor]` → `Tensor | None`;
+      (`dc1d/nn.py::DeformConv1d.__init__`, `nn.py:278`); `unconstrained: str = None` → `bool | None`
+      (`dc1d/nn.py::DeformConv1d.__init__`, `nn.py:286`); `mask: Optional[Tensor]` → `Tensor | None`;
       `device: str` → `torch.device | str | None`. `from __future__ import annotations`
       added to both modules.
 - [x] `torch.sum(..., axis=-1)` → `dim=` (was `ops.py:74,94,151,164,242`).
@@ -261,13 +264,13 @@ fixed. Findings that differ from the original review notes are called out.
       benchmark caveat.
 - [x] Bonus: int `padding` with `padding_mode="zeros"` previously applied **no
       padding at all** (the old `forward` only handled the `'same'` string in that
-      branch). Fixed in `DeformConv1d._pad` (`dc1d/nn.py:195-201`).
+      branch). Fixed in `DeformConv1d._pad` (`dc1d/nn.py::DeformConv1d._pad`).
 - [x] Bonus: `gLN`/`cLN` used the deprecated `torch.Tensor(1, 1, n)` constructor;
       now `torch.empty`.
 
 ## Tests
 
-There were **zero** tests. `tests/` now holds **370 passing / 72 skipped**
+There were **zero** tests. `tests/` now holds **403 passing / 72 skipped**
 (the skips are all `padding='same'` × `stride>1`, which is undefined).
 
 - [x] **1. Zero-offset equivalence** — `tests/test_equivalence.py:27`
@@ -343,11 +346,12 @@ There were **zero** tests. `tests/` now holds **370 passing / 72 skipped**
 - [x] `build` job: `uv build`, `uvx twine check dist/*`, then install the built
       wheel into a clean venv and import it — this is the job that would have
       caught the missing `dependencies` field.
-- [ ] **CI has not been executed.** All four jobs' commands were run locally and
-      pass on all four matrix versions (3.10 / 3.11 / 3.12 / 3.13), but the YAML
-      itself has never run on GitHub. **Left:** push and confirm the first run,
-      particularly that `setup-uv`'s `python-version` input plays well with the
-      checked-in `.python-version` pin of 3.12.
+- [x] **CI has run.** It triggers on `push: branches: ["**"]` and the work since
+      has gone through merged pull requests, so the YAML has executed. The
+      original open question, whether `setup-uv`'s `python-version` input plays
+      well with the checked-in `.python-version` pin of 3.12, is answered by
+      those runs rather than by anything in the tree; check the Actions tab if
+      you need to see it.
 - [ ] **No coverage reporting, no Windows/macOS runners, no CUDA runner.** Not asked
       for; noted as an obvious next step if the owner wants them.
 
@@ -355,8 +359,9 @@ There were **zero** tests. `tests/` now holds **370 passing / 72 skipped**
 
 Landed **after** tests 1–4 were green, and re-verified green afterwards.
 
-- [x] `efficient_linterpolate` rewritten (`dc1d/ops.py:65-194`) using
-      `torch.take_along_dim` + `torch.lerp`. Gone: the `U.repeat` int64 tile, the
+- [x] `efficient_linterpolate` rewritten (`dc1d/ops.py::efficient_linterpolate`)
+      using `torch.take_along_dim` + `torch.lerp` (the gather became an
+      `expand`ed `torch.gather` in the 2026-08 pass, E1; the `lerp` is unchanged). Gone: the `U.repeat` int64 tile, the
       `torch.stack([...gather...])` list comprehension, the `torch.zeros` memset,
       and the abs/max/multiply/sum chain. Since `U1 ≡ U0+1` by construction the
       two weights are exactly `1-f` and `f`.
@@ -375,12 +380,12 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       B=4 C=256 L=2048 K=3 d=8, 23.8 MiB output):** old **283 MiB** → new **91 MiB**,
       i.e. **~3.1× lower**. Note this is coarser than a CUDA allocator measurement
       and includes allocator retention.
-- [x] `dilated_positions` registered as a non-persistent buffer (`dc1d/nn.py:148`)
+- [x] `dilated_positions` registered as a non-persistent buffer (`dc1d/nn.py::DeformConv1d.__init__`)
       instead of the plain attribute at the old `nn.py:122`. It was missing from
       `state_dict()` and ignored by `.cuda()`.
 - [x] `torch.max(dilated_positions)` (old `ops.py:206`), a device reduction, replaced
-      with the Python constant `dilation * (kernel_size - 1)` (`dc1d/ops.py:128`).
-- [x] `L >= 2` guarded (`dc1d/ops.py:110`).
+      with the Python constant `dilation * (kernel_size - 1)` (`dc1d/ops.py::efficient_linterpolate`).
+- [x] `L >= 2` guarded (`dc1d/ops.py::efficient_linterpolate`).
 - [x] **CPU RSS reduction re-verified** on `bench/vs-torchvision`: pre-rewrite
       `291.0 MiB` → current `99.8 MiB` = **2.92×** at `B=4 C=256 L=2048 K=3 d=8`
       (TODO recorded 283 → 91 = 3.1×; agreement within RSS run-to-run variation).
@@ -429,8 +434,10 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       **Do not use it for this operator.**
 - [ ] **Dynamic shapes are unavailable for this kernel** (`BACKENDS.md` §5.6).
       `torch._dynamo.mark_dynamic` on the length axis raises
-      `ConstraintViolationError` — the graph specialises on `L` at
-      `dc1d/ops.py:184` (`take_along_dim(...).reshape(...)`). `dynamic=True` and
+      `ConstraintViolationError` — the graph specialises on `L` at the
+      `out_length * kernel_size` reshape in `efficient_linterpolate`. (The
+      traceback below was captured before the 2026-08 gather rewrite, so its
+      line number and operator name are those of the `take_along_dim` kernel.) `dynamic=True` and
       `maybe_mark_dynamic` do not raise only because they may specialise
       silently, which they do: **one new graph per length in all three
       regimes**, plus a **1.7–2.1× slower steady state** for asking. For a
@@ -454,7 +461,12 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       `dc1d/c`. `grid_sample/c` still wins fwd+bwd **12/13**, mean gap
       **1.26× → 1.19×** — about a quarter of it removed.
 
-      *Memory: this is what it actually buys, and it is large.* The autograd tape
+      *Memory: this is what it actually buys, and it is large.* **Superseded in
+      part by E6/E7 above: every ratio in this paragraph was measured against the
+      `take_along_dim` default, which the 2026-08 gather rewrite replaced. The
+      default now holds 3.0–3.4× where `offset_groups < channels` and
+      `recompute`'s advantage there is ~1.30×; at `offset_groups == channels`
+      nothing below changes.** The autograd tape
       holds **7.02× the output tensor**; the custom Function holds **1.03×**. The
       7× decomposes as output + `x0` + `x1` + **two full-size int64 indices** —
       `take_along_dim` broadcasts its index in the forward but its *backward*
@@ -502,7 +514,7 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
             less memory", with the `functools.partial` opt-in and the measured
             trade-off. The snippet was executed.
 - [ ] **Deferred perf work, not attempted:**
-      - [ ] Fuse the two `take_along_dim` gathers. `x1` is always `x0` shifted by one
+      - [ ] Fuse the two gathers in `_gather_pair`. `x1` is always `x0` shifted by one
             sample, so a single gather of a `(Lo, K, 2)` window — or a `Tensor.unfold`
             over the receptive field followed by one gather — should halve the gather
             traffic. *Lower priority than it was:* Inductor already fuses the forward
@@ -584,9 +596,11 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
 - [x] `playground/readme_example.py` and `playground/param_example.py` updated to
       match, and both run clean.
 - [x] This file.
-- [ ] **No CHANGELOG.** **Left:** write `CHANGELOG.md` covering this pass before
-      the next release — the `self.device` removal and the new offset-shape
-      `ValueError` are behaviour changes users need to see.
+- [x] **`CHANGELOG.md` written**, covering 0.2.0 back to 0.0.6, with the
+      behaviour changes users need to see (the `self.device` removal, the new
+      offset-shape `ValueError`, and the silent `PackedDeformConv1d` checkpoint
+      break) at the top. The release workflow reads its `## [x.y.z]` section as
+      the GitHub Release body; see the Release section below.
 - [ ] **No API reference / docs site.** Not asked for.
 
 ## Benchmarks
@@ -688,11 +702,13 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
       that a tag has a matching section; a missing one degrades to the tag message
       instead of failing. Consider making the build job fail when
       `CHANGELOG.md` has no section for the tag being built.
-- [ ] **Nothing has been published to PyPI, and the publish job cannot succeed
-      until the two items below are done.** That is exactly why a tag push does
-      *not* trigger it and `workflow_dispatch` does. PyPI still serves `0.0.7`
-      (confirmed 2026-08-07), so the first publish from this line would be
-      `v0.2.0`.
+- [x] **0.2.0 is published to PyPI** (2026-08-07). PyPI now carries 0.0.2,
+      0.0.4, 0.0.7 (yanked) and 0.2.0. Note 0.0.6 was tagged but never
+      published, so the paper pin is `dc1d==0.0.4`.
+- [ ] **The publish job is still unconfigured**, so that upload did not come
+      from it. A published version can never be re-uploaded, only yanked, which
+      is why a tag push does *not* trigger publishing and `workflow_dispatch`
+      does. Remaining, in order:
       1. **Trusted publisher on PyPI.** Add a publisher for project `dc1d`, owner
          `jwr1995`, repo `dc1d`, workflow filename `release.yml`, environment `pypi`.
          Do the same on TestPyPI with environment `testpypi`.
@@ -746,12 +762,10 @@ full table in **`benchmarks/BACKENDS.md` §3**. Reference:
 
 ## Explicitly not done
 
-- ~~Nothing was committed, branched, amended or pushed.~~ Superseded: the
-  modernisation work is committed, and the backend comparison lives on
-  `bench/vs-torchvision` (pushed, no PR opened).
+- ~~Nothing was committed, branched, amended or pushed.~~ Superseded: everything
+  is merged to `main`, `v0.2.0` is tagged, and 0.2.0 is on PyPI.
 - ~~No GPU was used and no GPU numbers are reported.~~ Superseded for the
   *backend comparison* only — see `benchmarks/BACKENDS.md` §4 (RTX 3090).
   Still true for the old-vs-new rewrite comparison.
 - `py.typed` not shipped (see Packaging).
-- No CHANGELOG (see Docs).
 - CI never executed on GitHub (see CI); the YAML itself is unvalidated.

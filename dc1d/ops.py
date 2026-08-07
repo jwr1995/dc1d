@@ -78,7 +78,7 @@ def _dilated_positions_long(
 # fraction. They differ only in how the backward is obtained, and therefore in
 # what has to be kept alive between the forward and the backward:
 #
-#   ``autograd``   let autograd differentiate through ``take_along_dim`` and
+#   ``autograd``   let autograd differentiate through ``gather`` and
 #                  ``lerp``. Correct, and the only variant that needs no
 #                  hand-written maths -- but ``lerp``'s backward needs both
 #                  ``x0`` and ``x1``, so two (B, C, L_out, K) tensors are held.
@@ -119,7 +119,7 @@ def _dilated_positions_long(
 # **Determinism.** ``dL/dx`` is a scatter-add, which on CUDA accumulates with
 # atomics and is therefore *not* bitwise reproducible run to run. Measured, for
 # all three variants alike -- this is not something the custom Function
-# introduces, because the ``autograd`` variant's ``take_along_dim`` backward is
+# introduces, because the ``autograd`` variant's ``gather`` backward is
 # the same scatter-add. ``dL/d(offsets)`` is a plain reduction and is
 # reproducible. Under ``torch.use_deterministic_algorithms(True)`` PyTorch
 # substitutes a deterministic ``scatter_add_`` rather than raising, and all
@@ -216,8 +216,10 @@ class _GatherLerpSaveDiff(torch.autograd.Function):
         # nn.Conv1d bit-exactness invariant depends on this.
         out = torch.lerp(x0, x1, w)
         # `x1 - x0` is read by the offset gradient and by nothing else, so an
-        # inference pass must not pay for it: without this guard the forward is
-        # 5-17% slower than the plain-autograd kernel (BACKENDS.md 5.9).
+        # inference pass must not pay for it: without this guard every forward
+        # allocates and writes an extra (B, C, L_out, K) tensor. The size of that
+        # saving is not in `benchmarks/BACKENDS.md`; section 5.9.3 times the
+        # variants against each other, not this guard against itself.
         # `ctx.needs_input_grad` is populated before `forward` runs; it is not
         # affected by `torch.no_grad()`, which is the one case this still
         # over-computes -- inference on a leaf that happens to require grad.
@@ -335,11 +337,14 @@ def efficient_linterpolate(
             between the forward and the backward. ``None`` means
             :data:`DEFAULT_GATHER_LERP`.
 
-            * ``'autograd'`` (default) -- differentiate through
-              ``take_along_dim`` and ``lerp``. No restrictions.
+            * ``'autograd'`` (default) -- differentiate through ``gather``
+              and ``lerp``. No restrictions.
             * ``'recompute'`` -- a custom :class:`torch.autograd.Function` that
-              saves only the integer index and the fraction, for **10-23%
-              slower** eager forward+backward and **0-19% faster** compiled.
+              saves the integer index, the fraction and the input ``x`` (which
+              the caller normally holds alive anyway), re-gathering ``x0``/``x1``
+              in the backward, for **10-23%
+              slower** eager forward+backward and **0-12% faster** compiled
+              (``benchmarks/BACKENDS.md`` section 5.9.7).
               Supports ``vmap`` and double backward.
 
               **How much memory it saves depends on ``offset_groups``**, and the
@@ -353,7 +358,10 @@ def efficient_linterpolate(
               ``take_along_dim`` forward and no longer applies.
             * ``'save-diff'`` -- saves ``x1 - x0``. Same compiled behaviour as
               ``'recompute'`` and a smaller eager latency cost (0-8%) for a
-              smaller memory saving (1.6-1.8x), but it is **not** usable with
+              smaller memory saving, quoted as 1.6-1.8x in section 5.9.4 but
+              measured against the pre-2026-08 ``take_along_dim`` default and so
+              overstated for the same reason as the bullet above), but it is
+              **not** usable with
               ``vmap``/``torch.func`` and **raises** under ``create_graph=True``.
               Kept for measurement; do not build on it.
 
@@ -634,7 +642,7 @@ if __name__ == "__main__":
     dilation = 3
     groups = 12
     stride = 2
-    _test = True  # Leave as False unless you want to see all intermediate shapes
+    _test = True  # set False to silence the intermediate-shape printing
     torch.random.manual_seed(1234)
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"

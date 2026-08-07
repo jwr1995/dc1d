@@ -1,9 +1,10 @@
 """
 Comparison of every available 1D deformable convolution backend.
 
-1.  **dc1d** -- ``take_along_dim`` + ``lerp`` + ``conv1d``, pure
-    ``torch.autograd``, no compilation step. What the package ships today
-    (``dc1d.ops.efficient_linterpolate``).
+1.  **dc1d** -- ``gather`` (on an expanded index) + ``lerp`` + ``conv1d``,
+    pure ``torch.autograd``, no compilation step. What the package ships today
+    (``dc1d.ops.efficient_linterpolate``). It gathered with ``take_along_dim``
+    until 2026-08; see ``dc1d.ops._gather_pair`` for why that had to change.
 2.  **torchvision** -- ``torchvision.ops.deform_conv2d``, a hand-written
     C++/CUDA kernel, degenerated to 1D (height 1). The compiled-kernel
     baseline.
@@ -1550,8 +1551,9 @@ def _mem_worker(payload: str) -> None:
 # depends on that: before it, Dynamo could not trace the layer cleanly and none
 # of these measurements were reachable.
 #
-# The question this section exists to answer: BACKENDS.md 5.1 recommends
-# `grid_sample` on the strength of winning 13/13 configurations *in eager mode*.
+# The question this section exists to answer: BACKENDS.md 4.4 measures
+# `grid_sample` winning 13/13 configurations *in eager mode*, and 6.1
+# recommends it on that strength.
 # `grid_sample` is one opaque ATen kernel that Inductor cannot fuse into;
 # dc1d's kernel is a chain of fusible elementwise ops around two gathers. If
 # dc1d's path is memory-bandwidth-bound, compilation should help it more, and
@@ -1971,10 +1973,13 @@ def backward_saved_footprint(device: str, dtype: torch.dtype) -> None:
     the output tensor itself is the autograd tape.
 
     Expressed as a multiple of the output so the accounting is checkable by
-    hand. For ``offset_groups=1`` the ``autograd`` variant should come out at
-    ~7x: the output, ``x0``, ``x1``, and -- the part that is easy to miss --
-    ``take_along_dim``'s backward saving its *broadcast* int64 index at full
-    output size, twice, at 2x the output's fp32 size each.
+    hand. For ``offset_groups < channels`` the ``autograd`` variant should come
+    out at ~3x: the output, ``x0`` and ``x1``. It was ~7x until 2026-08, when
+    the forward gathered with ``take_along_dim``, whose backward saved the
+    *broadcast* int64 index at full output size, twice. ``gather`` on an
+    explicitly expanded index saves a stride-0 view instead, so that term is
+    gone (BACKENDS.md section 5.9.4a). At ``offset_groups == channels`` the
+    expand is an identity and the figure is still ~8.5x.
     """
     print("\n" + "=" * 78)
     print("HELD BETWEEN FORWARD AND BACKWARD (torch.cuda.memory_allocated)")

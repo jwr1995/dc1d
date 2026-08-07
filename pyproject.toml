@@ -60,10 +60,11 @@ demo = [
 # Benchmark-only. `torchvision` is NOT a dependency of dc1d -- removing it is
 # the point of the current work -- and this group is deliberately not in
 # `default-groups`, so a plain `uv sync` never installs it. It exists only so
-# that `benchmarks/vs_torchvision.py` can be run:
+# that `benchmarks/backends.py` can be run (it was named `vs_torchvision.py`
+# while it compared only two backends):
 #     uv sync --group bench
-#     uv run --group bench python benchmarks/vs_torchvision.py --check
-# For CUDA numbers use a separate venv; see the module docstring of that script.
+#     uv run --group bench python benchmarks/backends.py --check
+# For CUDA numbers use a separate venv; see that script's module docstring.
 bench = [
     "torchvision",
 ]

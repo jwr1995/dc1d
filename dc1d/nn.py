@@ -77,7 +77,14 @@ class DeformConv1d(nn.Module):
             device: Optional device to move the layer to on construction. The forward
                 pass always follows the device of its input; this is a convenience
                 kwarg only.
-            interpolation_function (Callable): Interpolation kernel from dc1d.ops.
+            interpolation_function (Callable): Interpolation kernel. Must accept
+            the :func:`dc1d.ops.efficient_linterpolate` signature, including
+            ``unconstrained``, which ``forward`` always passes. In practice
+            that means ``efficient_linterpolate`` itself or a
+            ``functools.partial`` of it, for example to set ``gather_lerp``.
+            The reference kernels ``full_seq_linterpolate`` and
+            ``kernel_width_linterpolate`` take no ``unconstrained`` argument
+            and will raise ``TypeError`` here.
             unconstrained (bool): If True, kernel taps may sample anywhere in the
                 sequence rather than being confined to their own receptive field.
                 Default None, treated as False.
@@ -327,7 +334,14 @@ class PackedDeformConv1d(DeformConv1d):
                 Still experimental, beware of unexpected behaviour.
             offset_groups (int): Any divisor of in_channels. Default 1.
             device: Optional device to move the layer to on construction.
-            interpolation_function (Callable): Interpolation kernel from dc1d.ops.
+            interpolation_function (Callable): Interpolation kernel. Must accept
+            the :func:`dc1d.ops.efficient_linterpolate` signature, including
+            ``unconstrained``, which ``forward`` always passes. In practice
+            that means ``efficient_linterpolate`` itself or a
+            ``functools.partial`` of it, for example to set ``gather_lerp``.
+            The reference kernels ``full_seq_linterpolate`` and
+            ``kernel_width_linterpolate`` take no ``unconstrained`` argument
+            and will raise ``TypeError`` here.
             unconstrained (bool): See DeformConv1d.
             modulated (bool): Predict a DCNv2 modulation mask alongside the
                 offsets. Default False, which is plain DCNv1 and leaves the

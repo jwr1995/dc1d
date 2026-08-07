@@ -4,11 +4,15 @@
 #   Tag push (v*)      -> build, verify, and create the GitHub Release.
 #                         Needs no configuration beyond the built-in
 #                         GITHUB_TOKEN, so it works today.
-#   workflow_dispatch  -> the above, plus upload to TestPyPI or PyPI.
-#                         Needs a PyPI Trusted Publisher and a matching GitHub
-#                         environment, NEITHER OF WHICH EXISTS YET. Until they
-#                         do, the publish job will fail; that is why a tag push
-#                         does not trigger it.
+#   workflow_dispatch  -> build, then upload to TestPyPI or PyPI. NOT a superset
+#                         of the tag path: the tag/version check and the
+#                         GitHub Release are both gated on `refs/tags/v*`, so a
+#                         dispatch from a branch does neither. Needs a PyPI
+#                         Trusted Publisher and a matching GitHub environment;
+#                         as of the last edit to this file neither was
+#                         configured, so check the repository settings before
+#                         relying on it. That is why a tag push does not
+#                         trigger publishing.
 #
 # Release notes come from the matching CHANGELOG.md section, falling back to
 # the annotated tag's message. Both live in the repository, so the notes are
