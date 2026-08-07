@@ -1,4 +1,28 @@
+```text
+   ,--.       ,--.   ,--.
+ ,-|  | ,---./   | ,-|  |
+' .-. || .--'`|  |' .-. |
+\ `-' |\ `--. |  |\ `-' |
+ `---'  `---' `--' `---'
+```
+
 # dc1d (DeformConv1d)
+
+**1D deformable convolution in pure PyTorch. No C++, no CUDA, no build step.**
+
+[![CI](https://github.com/jwr1995/dc1d/actions/workflows/ci.yml/badge.svg)](https://github.com/jwr1995/dc1d/actions/workflows/ci.yml)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/jwr1995/dc1d/blob/main/CHANGELOG.md)
+[![PyPI](https://img.shields.io/pypi/v/dc1d?label=pypi&color=orange)](https://pypi.org/project/dc1d/)
+[![python](https://img.shields.io/badge/python-3.10%20to%203.13-blue)](https://github.com/jwr1995/dc1d/blob/main/pyproject.toml)
+[![torch](https://img.shields.io/badge/torch-%3E%3D2.7-ee4c2c)](pyproject.toml)
+[![tests](https://img.shields.io/badge/tests-403%20passed-brightgreen)](https://github.com/jwr1995/dc1d/blob/main/tests)
+[![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/jwr1995/dc1d/blob/main/LICENSE)
+
+[Demo notebook](https://github.com/jwr1995/dc1d/blob/main/docs/demo.ipynb) | [Changelog](https://github.com/jwr1995/dc1d/blob/main/CHANGELOG.md) | [Benchmarks](https://github.com/jwr1995/dc1d/blob/main/benchmarks/BACKENDS.md) | [Version audit](https://github.com/jwr1995/dc1d/blob/main/EQUIVALENCE.md) | [Usage](#usage) | [ONNX export](#onnx-export)
+
+> The `version` badge is this source tree; the `pypi` badge is what `pip install
+> dc1d` currently resolves to. They disagree because 0.2.0 has not been
+> published yet. See [Installation](#installation).
 
 A 1D implementation of a deformable convolutional layer implemented in pure Python in PyTorch. The code style is designed to imitate similar classes in PyTorch such as `torch.nn.Conv1d` and `torchvision.ops.DeformConv2d`.
 
@@ -19,7 +43,7 @@ build: https://pytorch.org/get-started/locally/.
 
 ## Installation
 
-*N.B. for the version we released for our paper, stick to `dc1d==0.0.6` or lower*
+*N.B. for the version we released for our paper, stick to `dc1d==0.0.4` or lower*
 
 [`CHANGELOG.md`](CHANGELOG.md) records what changed since, including why a
 0.0.x `PackedDeformConv1d` checkpoint will load without complaint and then

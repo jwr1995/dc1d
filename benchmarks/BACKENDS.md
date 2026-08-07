@@ -57,7 +57,7 @@ triton overrides : DISABLED
 
 | | what it is | compiled? | offset groups | boundary | bit-exact vs `nn.Conv1d`? |
 |---|---|---|---|---|---|
-| **dc1d** | `take_along_dim` + `lerp` + `conv1d` (`dc1d/ops.py:65`) | no | any divisor of `C` | clamp | **yes** |
+| **dc1d** | `gather` on an expanded index + `lerp` + `conv1d` (`dc1d/ops.py::_gather_pair`) | no | any divisor of `C` | clamp | **yes** |
 | **torchvision** | `deform_conv2d` C++/CUDA kernel, height 1 | **yes** | any divisor of `C` | zero-pad | yes |
 | **grid_sample** | `F.grid_sample` on `(B, C, 1, L)` (`benchmarks/backends.py`) | no (ATen builtin) | any divisor of `C` | clamp (`border`) | no |
 | **tinymera** | independent 2nd implementation, two kernels | no | **fixed at `C`** | clamp | gather: yes; grid_sample: no |
@@ -75,12 +75,15 @@ by linear interpolation between `floor(T)` and `floor(T)+1`, then contract the
 `K` taps against the kernel weights. They differ in *how*:
 
 * **dc1d** keeps `t*stride + k*dilation` in `long` and carries only the
-  sub-sample fraction in float (`dc1d/ops.py:140-162`), then does two
-  `take_along_dim` gathers and one `lerp` (`dc1d/ops.py:184-193`). The tap axis
+  sub-sample fraction in float (`dc1d/ops.py::efficient_linterpolate`), then does two
+  `gather` calls and one `lerp` (`dc1d/ops.py::_gather_pair`). The tap axis
   is flattened and contracted with a stride-`K` grouped `F.conv1d`
-  (`dc1d/nn.py:255-262`). `take_along_dim` broadcasts, so the index tensor is
-  never tiled to the channel count — that is what makes `1 < offset_groups < C`
-  work without a `C`-sized int64 index.
+  (`dc1d/nn.py::DeformConv1d.forward`). The index handed to `gather` is an
+  `expand`, a stride-0 view, so it is never tiled to the channel count — that
+  is what makes `1 < offset_groups < C` work without a `C`-sized int64 index.
+  Until 2026-08 this used `take_along_dim`, which broadcasts and achieves the
+  same thing in the forward, but is not exportable to ONNX and materialised
+  the index on the backward tape (§5.9.4a).
 * **torchvision** does the whole thing in one fused kernel. Offsets are packed
   into the channel axis as `(offset_group, kh, kw, {y, x})`; with `kh = 1` the
   height interpolation is a no-op. The `(y, x)` ordering and the offset sign
@@ -251,6 +254,13 @@ implementation of the same algorithm by the same author, so the question is
 which classes recur. Probes are executable (`backends.py --defects`) except
 where noted.
 
+> **Not reproducible from this repository.** Only `tinymera/ops/deform_conv1d.py`
+> is vendored here (`benchmarks/_tinymera_ref.py`). The **D5** and **D6b** rows
+> below were measured against `tinymera/nn/deform_conv1d.py` in a private
+> checkout, so `--defects` cannot re-run them and a reader cannot verify them.
+> Two of the six grounds in the §6.3 recommendation rest on those rows; weigh
+> them accordingly.
+
 **tinymera reference**: `fix/causality` @ `04593f38` (open as tinymera PR #1
 against `feature/exciting-plc`), which is "post-fix". "Pre-fix" is
 `feature/exciting-plc` @ `ecf8da24`. Sources:
@@ -258,13 +268,13 @@ against `feature/exciting-plc`), which is "post-fix". "Pre-fix" is
 
 | # | bug class | dc1d pre-fix | dc1d post-fix | tinymera pre-fix | tinymera post-fix |
 |---|---|---|---|---|---|
-| **D1** | dtype-inherited position arithmetic | **present** — `linspace` in offset dtype; 13952/15998 rows wrong at fp16, `L=16000` | fixed — window starts in `long`, only the fraction in float (`dc1d/ops.py:140-162`) | **present** — `torch.arange(T_out, dtype=x.dtype)` (both kernels) | fixed — forced `torch.float32` (`ops/deform_conv1d.py:110-111, 209-210`) |
+| **D1** | dtype-inherited position arithmetic | **present** — `linspace` in offset dtype; 13952/15998 rows wrong at fp16, `L=16000` | fixed — window starts in `long`, only the fraction in float (`dc1d/ops.py::efficient_linterpolate`) | **present** — `torch.arange(T_out, dtype=x.dtype)` (both kernels) | fixed — forced `torch.float32` (`ops/deform_conv1d.py:110-111, 209-210`) |
 | **D2** | float64 silently downcast | absent | absent — exact at every dtype | absent | **present (introduced by the D1 fix)** — `offsets.float()` and `x.float()`; measured `1.5e-05` error on a float64 input, i.e. float32-sized |
-| **D3** | `repeat` vs `repeat_interleave` for offset groups | **present** — `U.repeat` tiled to `G*C`; `1 < G < C` raised `RuntimeError` | fixed — `take_along_dim` broadcasts, channel axis viewed as `(G, C/G)` (`dc1d/ops.py:180-193`) | **n/a — structurally unreachable** | **n/a** — offsets are always per-channel; there is no group→channel mapping to get wrong |
-| **D4** | boundary clamp to `L` vs `L-1` | **present** — clamp to `x.shape[-1]`; at `T == L` *both* weights fell to 0, output exactly `0.0` | fixed — index clamped to `[0, L-2]`, fraction forced to 0/1 (`dc1d/ops.py:151-162`) | absent — `pos.clamp(0, T_in - 1)` was always correct | absent — verified: saturates to `x[L-1]` for a `1e6` offset |
-| **D5** | stride/dilation dropped in the offset-prediction path | **present** — offset conv hardcoded `stride=1, dilation=1`; `stride=2, L=40` returned 38 instead of 19 | fixed — both forwarded (`dc1d/nn.py:337-348`) | **present** | **STILL PRESENT (partial)** — `dilation` is forwarded, **`stride` is hardcoded to 1** (`nn/deform_conv1d.py:175-183`) |
-| **D6** | the index clamp hides shape bugs (no contract validation) | **present** — wrong `L_out` produced plausible wrong-length output | fixed — `ValueError` against the closed form (`dc1d/nn.py:236-243`), plus `expected_offset_positions()` | **present** | **STILL PRESENT** — sampling kernels take `T_out` from `offsets.shape` and clamp; nothing validates it |
-| **D7** | `2^7`-style XOR-for-exponent | **present** — a benchmark ran `dilation=5` for three years | fixed — `2**7` (`dc1d/nn.py:487`) | absent | absent — `grep -rE '[0-9]\s*\^\s*[0-9]'` over the tree returns only a comment |
+| **D3** | `repeat` vs `repeat_interleave` for offset groups | **present** — `U.repeat` tiled to `G*C`; `1 < G < C` raised `RuntimeError` | fixed — the `gather` index is an `expand`, channel axis viewed as `(G, C/G)` (`dc1d/ops.py::_gather_pair`) | **n/a — structurally unreachable** | **n/a** — offsets are always per-channel; there is no group→channel mapping to get wrong |
+| **D4** | boundary clamp to `L` vs `L-1` | **present** — clamp to `x.shape[-1]`; at `T == L` *both* weights fell to 0, output exactly `0.0` | fixed — index clamped to `[0, L-2]`, fraction forced to 0/1 (`dc1d/ops.py::efficient_linterpolate`) | absent — `pos.clamp(0, T_in - 1)` was always correct | absent — verified: saturates to `x[L-1]` for a `1e6` offset |
+| **D5** | stride/dilation dropped in the offset-prediction path | **present** — offset conv hardcoded `stride=1, dilation=1`; `stride=2, L=40` returned 38 instead of 19 | fixed — both forwarded (`dc1d/nn.py::PackedDeformConv1d.__init__`) | **present** | **STILL PRESENT (partial)** — `dilation` is forwarded, **`stride` is hardcoded to 1** (`nn/deform_conv1d.py:175-183`) |
+| **D6** | the index clamp hides shape bugs (no contract validation) | **present** — wrong `L_out` produced plausible wrong-length output | fixed — `ValueError` against the closed form (`dc1d/nn.py::DeformConv1d.forward`), plus `expected_offset_positions()` | **present** | **STILL PRESENT** — sampling kernels take `T_out` from `offsets.shape` and clamp; nothing validates it |
+| **D7** | `2^7`-style XOR-for-exponent | **present** — a benchmark ran `dilation=5` for three years | fixed — `2**7` (`dc1d/nn.py, the `__main__` demo block`) | absent | absent — `grep -rE '[0-9]\s*\^\s*[0-9]'` over the tree returns only a comment |
 
 ### D1 — the candidate `grid_sample` backend is exposed to this too
 
@@ -528,7 +538,7 @@ CC=<a C compiler> .venv-cuda/bin/python benchmarks/backends.py \
 Notation: `/c` is `torch.compile(mode="default")`, `/ma` is
 `mode="max-autotune"`. Bracketed factors are **eager dc1d / variant**, so
 `> 1×` means faster than the eager default kernel. ⚠ marks rows where a second
-independent run disagreed by more than 20% — see §5.7.
+independent run disagreed by more than 20% — see §5.8.
 
 ### 5.1 Latency — forward (ms)
 
@@ -1145,6 +1155,13 @@ memory 1.6–2.1× eager and 1.3–1.9× compiled, and brings `dc1d` to parity w
 `grid_sample` on memory in 5 of 13 configurations where it was previously
 1.5–2.8× worse.
 
+> **Superseded in part, 2026-08.** Every ratio in this paragraph is measured
+> against the `take_along_dim` default, which no longer exists. The default now
+> holds **3.0–3.4×** the output where `offset_groups < channels`, so
+> `recompute`'s remaining advantage there is about **1.30×**, not 1.6–2.1×. At
+> `offset_groups == channels` the tape is unchanged at 8.5× and the paragraph
+> stands. See §5.9.4a.
+
 Therefore: **shipped as an opt-in, not adopted as the default.** The default
 stays `'autograd'` because `'recompute'` — the only variant safe to make a
 default, per §5.9.5 — costs 10–23% of eager forward+backward, and most users of
@@ -1189,7 +1206,10 @@ it should keep its ⚠ and should not carry any conclusion.
 > So the recommendation narrows once more:
 >
 > * **`torch.compile` + `gather_lerp='recompute'` is now the default advice**
->   for anyone who can compile. It is 0–12% faster and 1.3–1.9× smaller than
+>   for anyone who can compile — though see §5.9.4a: the 2026-08 gather rewrite
+>   took most of the memory saving into the default, leaving `recompute` worth
+>   ~1.30× where `offset_groups < channels`. It is 0–12% faster and 1.3–1.9×
+>   smaller than
 >   compiled dc1d with the stock backward, keeps the sampling bit-exact, and
 >   supports `vmap` and double backward.
 > * **`grid_sample` is now only for the case where forward+backward *latency*
@@ -1305,7 +1325,10 @@ kernels whether the backward is hand-written or derived by autograd, because
 AOTAutograd's partitioner already reaches that schedule from the generic graph.
 Eager it is a wash or slower. What it does buy is memory — the tape drops from
 **7.0× the output tensor to 1.03×** — which closes most of `grid_sample`'s
-*memory* advantage but none of its latency advantage.
+*memory* advantage but none of its latency advantage. (The 7.0× figure is the
+pre-2026-08 `take_along_dim` default; the current default is 3.0–3.4× at
+`offset_groups < channels`, so less of that closing is left to `recompute`.
+§5.9.4a.)
 
 **That strengthens the case against Triton rather than weakening it.** The
 cheap software fix has been applied and the remaining gap survived it, so what

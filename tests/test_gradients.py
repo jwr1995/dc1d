@@ -96,7 +96,8 @@ def test_packed_offsets_receive_gradient():
 
 
 def test_index_tensor_carries_no_gradient():
-    """The floor()/clamp() index path must stay detached (U0 is an integer)."""
+    """The floor()/clamp() index path must stay detached (`idx` is an integer
+    index and carries no gradient; only the fraction `w` does)."""
     torch.manual_seed(0)
     n_offsets = output_length(LENGTH, KERNEL)
     x = torch.randn(BATCH, CHANNELS, LENGTH, requires_grad=True)
