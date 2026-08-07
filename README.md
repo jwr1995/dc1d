@@ -19,6 +19,8 @@ build: https://pytorch.org/get-started/locally/.
 
 ## Installation
 
+*N.B. for the version we released for our paper, stick to `dc1d==0.0.6` or lower*
+
 ```
 pip install dc1d
 ```
