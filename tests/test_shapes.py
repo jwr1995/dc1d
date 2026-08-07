@@ -110,9 +110,19 @@ def test_short_input_raises():
         model(torch.randn(BATCH, CHANNELS, 1), torch.zeros(BATCH, 1, 1, 3))
 
 
-def test_mask_is_rejected():
+def test_misshapen_mask_is_rejected():
+    """Modulation is implemented now (see tests/test_modulation.py), but a mask
+    that does not line up with the offsets must still fail loudly."""
     model = DeformConv1d(CHANNELS, CHANNELS, 3, padding="valid")
     x = torch.randn(BATCH, CHANNELS, LENGTH)
     n = model.expected_offset_positions(LENGTH)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="mask shape"):
         model(x, torch.zeros(BATCH, 1, n, 3), mask=torch.zeros(1))
+
+
+def test_mask_does_not_change_the_output_shape():
+    model = DeformConv1d(CHANNELS, CHANNELS, 3, padding="valid")
+    x = torch.randn(BATCH, CHANNELS, LENGTH)
+    n = model.expected_offset_positions(LENGTH)
+    offsets = torch.zeros(BATCH, 1, n, 3)
+    assert model(x, offsets, torch.rand_like(offsets)).shape == model(x, offsets).shape

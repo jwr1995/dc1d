@@ -13,7 +13,11 @@ readme = "README.md"
 license = { file="LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.4",
+    # 2.7 is the oldest release the ONNX export path is verified against; see
+    # TODO.md E1/E8. Nothing in the layer needs a 2.7 API, so if you are pinned
+    # to an older torch the library will still import and run, but the export
+    # tests are unverified there and `tests/test_export.py` will likely fail.
+    "torch>=2.7",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -63,10 +67,20 @@ demo = [
 bench = [
     "torchvision",
 ]
+# ONNX export tests (`tests/test_export.py`). Kept out of `dev` so the default
+# `uv sync` stays small; CI installs it explicitly for one Python version:
+#     uv run --group export pytest tests/test_export.py
+# Without the group those tests skip, which is why CI runs them separately
+# rather than relying on the default `pytest` invocation to cover them.
+export = [
+    "onnx>=1.17",
+    "onnxruntime>=1.19",
+    "onnxscript>=0.1",
+]
 
 # ---------------------------------------------------------------------------
 # CPU-only torch for the development environment. The published wheel keeps a
-# plain `torch>=2.4` dependency (see [project.dependencies]); this section only
+# plain `torch>=2.7` dependency (see [project.dependencies]); this section only
 # affects `uv sync` / `uv run` in this checkout.
 # ---------------------------------------------------------------------------
 [tool.uv.sources]

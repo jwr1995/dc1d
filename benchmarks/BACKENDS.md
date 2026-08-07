@@ -919,6 +919,14 @@ launch-count headroom left to take.
 
 #### 5.9.4 Memory — where the Function actually pays
 
+> **Superseded in part, 2026-08.** Everything in this subsection measures the
+> `take_along_dim` forward, which is no longer the default: `_gather_pair` now
+> uses `torch.gather` on an expanded index (see §5.9.4a for why, and for what
+> the numbers become). The **7.02× figure below is a property of
+> `take_along_dim`, not of the `autograd` variant**, and it is now 3.02–3.35×.
+> `save-diff` and `recompute` are unaffected. The tables are kept as measured
+> because they are the baseline §5.9.4a is a delta against.
+
 Latency is not the figure of merit for this operator. dc1d is
 memory-bandwidth-bound and peak memory is what caps batch size and sequence
 length in the speech-separation regime it exists for. The quantity that
@@ -978,6 +986,99 @@ the allocator is deterministic, unlike the timings:
 * The exception is `convtasnet-H512`, where the peak is set by a forward
   transient (5188 MiB of the 5939 MiB peak is reached before the backward
   starts), so shrinking the tape is invisible to the high-water mark.
+
+#### 5.9.4a `gather` on an expanded index — the 2026-08 default change
+
+`_gather_pair` was changed from `take_along_dim` to `torch.gather` on an
+explicitly `expand`ed index. The motive was correctness, not memory:
+`take_along_dim` decomposes to a negative-index wrap whose modulus the ONNX
+exporter freezes at the export-time length, so exported models read the wrong
+samples at any longer input (`CLAUDE.md`, `tests/test_export.py`). The forward
+is bit-identical, `torch.equal` in 27 of 27 configurations across all three
+`gather_lerp` modes. But it also moves the memory numbers above, so they are
+re-measured here.
+
+**Hardware differs from the rest of this document.** These are on an
+**A100-SXM4-80GB**, torch 2.13.0+cu129, not the RTX 3090 used elsewhere, and
+**the GPU was shared with another job at 50–100% utilisation throughout**.
+Memory is unaffected by that (the allocator is deterministic, and the
+`take_along_dim` column below reproduces §5.9.4 to the decimal: 21.0 MiB /
+7.02×, 203.8 MiB / 8.56×), which is what licenses the comparison. **Latency
+under contention is indicative only** and is reported as such.
+
+**The mechanism, read off the tape directly** (`small`, output 2.99 MiB). Both
+forms decompose to the same `GatherBackward0`; only the saved index differs:
+
+```
+take_along_dim    _saved_index stride=(196224,196224,3066,1)   5.988 MiB
+gather on expand  _saved_index stride=(3066,3066,0,1)          0.094 MiB
+```
+
+Channel stride **3066 versus 0**. `take_along_dim` broadcasts by materialising a
+real copy before dispatching to gather; handing `gather` an explicit `expand`
+keeps the stride-0 view all the way onto the tape. This is the answer to the
+question §5.9.4 left open, and it is the opposite of the concern that motivated
+the original `take_along_dim` choice.
+
+Held between forward and backward, `autograd` mode, as a multiple of the output:
+
+| config | offset groups | `take_along_dim` | `gather` |
+|---|---|---|---|
+| `B=4 C=64 L=1024`, og=1 | og < C | 7.02× | **3.09×** |
+| `B=4 C=256 L=2048 d=8`, og=1 | og < C | 7.06× | **3.05×** |
+| `B=4 C=128 L=4096`, og=8 | og < C | 7.10× | **3.35×** |
+| `B=1 C=256 L=16000`, og=1 | og < C | 7.02× | **3.02×** |
+| `B=4 C=64 L=1024`, og=64 | og == C | 8.50× | 8.50× |
+| `B=4 C=256 L=2048 d=8`, og=256 | og == C | 8.56× | 8.57× |
+| `B=8 C=512 L=8000`, og=512 | og == C | 8.50× | 8.50× |
+
+The new 3.0× decomposes exactly as the old 7.0× did: output, `x0`, `x1`, the
+compact index, the fraction. The four extra multiples were precisely the two
+materialised int64 indices, and they are gone.
+
+Peak `max_memory_allocated`, one forward+backward, factor is `take_along_dim` /
+`gather`, so > 1× means the new default is smaller:
+
+| config | offset groups | eager | compiled |
+|---|---|---|---|
+| `B=4 C=64 L=1024`, og=1 | og < C | 1.56× | 2.45× |
+| `B=4 C=256 L=2048 d=8`, og=1 | og < C | 1.57× | 2.48× |
+| `B=4 C=128 L=4096`, og=8 | og < C | 1.51× | 2.21× |
+| `B=1 C=256 L=16000`, og=1 | og < C | 1.57× | 2.48× |
+| depthwise offsets (og == C), 4 configs | og == C | 1.24× | 1.00× |
+
+**Two consequences, and the second one matters more than the first.**
+
+1. `offset_groups < channels` improves across the board, 1.5–1.6× eager and
+   2.2–2.5× compiled, for free. `offset_groups == channels` gains only a
+   forward transient: the expand is an identity there so nothing is broadcast,
+   but `take_along_dim` still allocated its index copy while the original was
+   alive (isolated probe, output 2.99 MiB: 23.95 MiB transient versus 14.97 MiB,
+   a difference of exactly 3× the output). The tape is unchanged, so compiled
+   shows nothing.
+
+2. **`recompute`'s memory case is materially weaker than §5.9.4 documents**, for
+   the configurations where the new default already won. Against the old default
+   `recompute` was worth 1.6–2.1× eager peak; against the new one it is 1.30× on
+   `B=4 C=64 L=1024` (21.2 MiB versus 16.3 MiB) rather than 1.91×. Where
+   `offset_groups == channels` it keeps its full value, because that is exactly
+   where the new default gains nothing. `save-diff` and `recompute` are
+   themselves unchanged, 18 of 18 rows identical to within 0.2 MiB: their
+   forwards run inside an `autograd.Function` with grad disabled, so
+   `_gather_pair` never builds a tape there.
+
+**Latency, indicative only** (contended GPU; both sides identically warmed,
+reversed round-robin, min across 9–10 rounds). CUDA eager favours `gather` in 34
+of 36 rows, 1.0–1.5× on the interpolation forward; the two exceptions (0.98×,
+0.99×) are inside their own round spread. Compiled is a wash on the forward, as
+expected since Inductor generates its own indexing and never sees
+`take_along_dim`; the only sub-0.9× readings failed to reproduce across two
+dedicated repeats. On **CPU** the gain is real but strongly shape-dependent: the
+isolated `_gather_pair` forward is 2.2–9.9× at one thread, but the honest
+user-facing figure is the whole layer, at **1.15–4.53× forward** and
+**1.15–1.85× forward+backward**, and the depthwise configurations get close to
+nothing (1.05×). A single-shape CPU speedup quoted on its own will mislead in
+either direction.
 
 #### 5.9.5 What a custom Function costs
 

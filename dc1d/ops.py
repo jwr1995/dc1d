@@ -130,8 +130,43 @@ def _dilated_positions_long(
 
 
 def _gather_pair(xg: Tensor, idx: Tensor) -> tuple[Tensor, Tensor]:
-    """``(x[i], x[i + 1])`` along the length axis of ``(B, G, C/G, L)``."""
-    return torch.take_along_dim(xg, idx, dim=3), torch.take_along_dim(xg, idx + 1, dim=3)
+    """
+    ``(x[i], x[i + 1])`` along the length axis of ``(B, G, C/G, L)``.
+
+    ``idx`` has a singleton channel axis and is `expand`ed rather than tiled, so
+    one index serves every channel in its offset group. The expansion is a
+    stride-0 view that ``gather`` reads through a strided iterator, and the view
+    is what its backward saves: measured, ``_saved_index`` comes out with stride
+    ``(3066, 3066, 0, 1)`` at 0.094 MiB where ``take_along_dim`` saved
+    ``(196224, 196224, 3066, 1)`` at 5.988 MiB, because ``take_along_dim``
+    broadcasts by materialising a copy before dispatching to gather. That is
+    worth 1.5-1.6x peak memory eager and 2.2-2.5x compiled whenever
+    ``offset_groups < channels`` (``BACKENDS.md`` 5.9.4a). This is the same trick
+    ``_scatter_input_grad`` uses.
+
+    **Why not ``take_along_dim``.** It broadcasts the index itself, so the
+    ``expand`` here looks redundant, and it was what this function used to call.
+    But ``take_along_dim`` decomposes to a *negative-index wrap*,
+    ``index % self.size(dim)``, before the gather, and **from torch 2.10** the
+    ONNX exporter constant-folds that modulus against the export-time length:
+    the graph gets a literal ``Mod(index, 200)`` for a model exported at
+    ``L = 200``. Every longer input then wraps around and reads the wrong
+    samples, at full signal magnitude, with the *right* output shape and no
+    error raised. ``gather`` takes no negative indices, so it emits no ``Mod``
+    and stays length-agnostic. Our indices are clamped into ``[0, L - 2]``
+    regardless, so the wrap was only ever dead arithmetic.
+
+    Bisected across CPU wheels (``tests/test_export.py``, TODO.md E8): clean on
+    2.7, 2.8, 2.9; broken on 2.10, 2.11, 2.12, 2.13. Do not "restore"
+    ``take_along_dim`` on the grounds that an old torch exports it correctly.
+    """
+    shape = (xg.shape[0], xg.shape[1], xg.shape[2], idx.shape[3])
+    # `+ 1` before the expand, never after: on the expanded view it would
+    # materialise the full-size int64 tensor this is written to avoid.
+    return (
+        torch.gather(xg, 3, idx.expand(shape)),
+        torch.gather(xg, 3, (idx + 1).expand(shape)),
+    )
 
 
 def _scatter_input_grad(grad_out: Tensor, idx: Tensor, w: Tensor, length: int) -> Tensor:
@@ -143,7 +178,7 @@ def _scatter_input_grad(grad_out: Tensor, idx: Tensor, w: Tensor, length: int) -
     ``expand``ed to the channel axis rather than materialised: ``scatter_add_``
     reads it through a strided iterator, so a stride-0 view costs nothing and
     avoids an int64 tensor the size of the output -- the same reason the forward
-    uses ``take_along_dim`` rather than ``gather``.
+    expands rather than tiles in :func:`_gather_pair`.
     """
     batch, groups, per_group, _ = grad_out.shape
     hi = grad_out * w
@@ -303,13 +338,19 @@ def efficient_linterpolate(
             * ``'autograd'`` (default) -- differentiate through
               ``take_along_dim`` and ``lerp``. No restrictions.
             * ``'recompute'`` -- a custom :class:`torch.autograd.Function` that
-              saves only the integer index and the fraction. Measured on an RTX
-              3090 (``benchmarks/BACKENDS.md`` section 5.9): **1.6-2.1x lower
-              peak memory** eager and **1.5-1.9x** under ``torch.compile``, for
-              **10-23% slower** eager forward+backward and **0-19% faster**
-              compiled forward+backward. Supports ``vmap`` and double backward.
-              Worth choosing when peak memory is the constraint, and worth
-              choosing unconditionally under ``torch.compile``.
+              saves only the integer index and the fraction, for **10-23%
+              slower** eager forward+backward and **0-19% faster** compiled.
+              Supports ``vmap`` and double backward.
+
+              **How much memory it saves depends on ``offset_groups``**, and the
+              answer changed when the default forward moved to ``gather``
+              (``benchmarks/BACKENDS.md`` sections 5.9.4 and 5.9.4a). With
+              ``offset_groups == channels`` the default holds 8.5x the output and
+              this saves **1.6-2.1x** peak eager, unchanged and still clearly
+              worth it. With ``offset_groups < channels`` the default now holds
+              only ~3x, and the saving is down to about **1.3x**. The older
+              1.6-2.1x figure quoted for that case was against the
+              ``take_along_dim`` forward and no longer applies.
             * ``'save-diff'`` -- saves ``x1 - x0``. Same compiled behaviour as
               ``'recompute'`` and a smaller eager latency cost (0-8%) for a
               smaller memory saving (1.6-1.8x), but it is **not** usable with
@@ -397,10 +438,11 @@ def efficient_linterpolate(
     # ------------------------------------------------------------------
     # Gather + lerp.
     #
-    # `take_along_dim` broadcasts its non-indexed dimensions, so the index tensor
-    # never has to be tiled up to the channel count. Viewing the channel axis as
-    # (groups, channels_per_group) lets a single index serve every channel in its
-    # offset group, including the 1 < groups < channels case.
+    # The index tensor is never tiled up to the channel count: it carries a
+    # singleton channel axis and `_gather_pair` expands it to a stride-0 view.
+    # Viewing the channel axis as (groups, channels_per_group) lets a single
+    # index serve every channel in its offset group, including the
+    # 1 < groups < channels case.
     # ------------------------------------------------------------------
     per_group = channels // groups
     xg = x.reshape(batch, groups, per_group, length)
