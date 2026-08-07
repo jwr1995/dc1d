@@ -10,6 +10,10 @@
 #                         do, the publish job will fail; that is why a tag push
 #                         does not trigger it.
 #
+# Release notes come from the matching CHANGELOG.md section, falling back to
+# the annotated tag's message. Both live in the repository, so the notes are
+# reviewable in a PR rather than typed into a web form.
+#
 # Publishing is deliberately a human action rather than a tag side effect. A
 # PyPI version can never be re-uploaded, so the irreversible step asks first.
 # See the "Release" section of TODO.md for what remains to enable it.
@@ -97,14 +101,32 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Release notes from the annotated tag
+      - name: Release notes
         run: |
-          # actions/checkout leaves the tag as a ref but not necessarily as the
-          # annotated object, so re-fetch it before reading its message.
-          git fetch --force --tags
-          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.md
+          # Preference order: the CHANGELOG.md section for this version, then
+          # the annotated tag's own message, then GitHub's commit summary. The
+          # CHANGELOG comes first because a release body worth reading is longer
+          # than a tag message should be.
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v want="[$VERSION]" '
+            /^## / { if (found) exit; if (index($0, want)) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+
+          if [ -s notes.md ]; then
+            echo "Using the CHANGELOG.md section for $VERSION."
+          else
+            echo "::warning::No CHANGELOG.md section for $VERSION; \
+                  falling back to the tag message."
+            # actions/checkout leaves the tag as a ref but not necessarily as
+            # the annotated object, so re-fetch it before reading its message.
+            git fetch --force --tags
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.md
+          fi
+
           if [ ! -s notes.md ]; then
-            echo "::warning::$GITHUB_REF_NAME has no message; generating notes from commits"
+            echo "::warning::$GITHUB_REF_NAME has no message either; \
+                  generating notes from commits"
           fi
 
       - name: Create or update the release
