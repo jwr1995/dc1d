@@ -1376,3 +1376,106 @@ first place.
 D5 and D6b now** — both are live correctness bugs in code that is on its way to
 being merged, and neither is what that PR set out to fix.
 
+
+---
+
+## 7. dc1d 0.0.4 versus 0.2.0, on GPU
+
+Sections 1-6 compare dc1d against other implementations. This one compares dc1d
+against its own past: the oldest still-installable PyPI release against the
+current one. It exists because the old-versus-new figures elsewhere in the
+project (`TODO.md`, Benchmarks) are **CPU wall-clock and CPU RSS**, and the GPU
+equivalent had never been measured.
+
+Both versions installed **from PyPI**, both against **the same torch build**, so
+dc1d is the only variable. `DeformConv1d` with caller-supplied offsets, so this
+times the interpolation kernel and not two different offset-prediction networks.
+
+| | |
+|---|---|
+| GPU | NVIDIA A100-SXM4-80GB, driver 580.126.09 |
+| torch | 2.7.1+cu126 in **both** environments |
+| old | `dc1d==0.0.4` + `torchvision==0.22.1+cu126` (0.0.4 declares no dependencies and imports torchvision at module scope) |
+| new | `dc1d==0.2.0` |
+| dtype / stride / padding | fp32, `stride=1`, `padding='valid'` |
+| latency | minimum of 24 `blocked_autorange` medians per cell (3 subprocesses x 8 reps), identical 10-iteration warmup on both sides |
+| peak memory | one subprocess per (version, config, mode), so allocator state is never shared |
+| raw data | `results/v0.0.4_vs_v0.2.0.jsonl` |
+| figures | regenerate with `uv run --group demo python benchmarks/plot_version_comparison.py` |
+
+> **Contended machine.** All four A100s carried another user's job at 75-100%
+> utilisation for the whole run. Latency minima are the best available estimate
+> of uncontended cost, but they are not clean; 0.0.4's plain-config timings were
+> visibly bimodal. **Peak memory is exact**: it came out bit-identical across all
+> three rounds, and the plotting script asserts that rather than assuming it.
+
+### 7.1 Latency
+
+![latency](figures/01_latency.png)
+
+### 7.2 Peak VRAM
+
+![peak VRAM](figures/02_peak_vram.png)
+
+### 7.3 How much 0.2.0 wins by
+
+![ratios](figures/03_ratios.png)
+
+| config | mode | 0.0.4 ms | 0.2.0 ms | speedup | 0.0.4 MiB | 0.2.0 MiB | memory |
+|---|---|---|---|---|---|---|---|
+| plain `B=4 C=64 L=4096 K=3 d=1 g=1 og=1` | fwd | 0.952 | 0.403 | 2.36x | 152.6 | 45.7 | 3.34x |
+| | fwd+bwd | 1.642 | 1.159 | 1.42x | 244.7 | 97.5 | 2.51x |
+| depthwise `B=4 C=256 L=4096 K=3 d=4 g=og=256` | fwd | 3.179 | 1.527 | 2.08x | 752.0 | 632.0 | 1.19x |
+| | fwd+bwd | 7.116 | 3.203 | 2.22x | 1120.0 | 744.0 | 1.51x |
+| long-seq `B=1 C=512 L=16000 K=3 d=1 g=1 og=1` | fwd | 4.471 | 1.021 | 4.38x | 1194.6 | 350.7 | 3.41x |
+| | fwd+bwd | 10.949 | 4.391 | 2.49x | 1917.9 | 760.9 | 2.52x |
+
+### 7.4 Three things the table does not show
+
+**The memory win is mostly an `offset_groups < channels` effect.** The weakest
+cell is depthwise forward, at 1.19x, and the reason is structural: at
+`offset_groups == channels`, 0.0.4's `U.repeat(1, C, ...)` is a no-op, so the
+channel-sized int64 index it would otherwise materialise never exists. That is
+the same boundary section 5.9.4a draws for `gather_lerp='recompute'`, from the
+other side. It is worth knowing because **the DTCN configuration is depthwise**,
+so it sits in the regime where 0.2.0's memory advantage is smallest.
+
+**Both versions are CPU-dispatch-bound at these sizes.** A launch-only timing
+puts 0.0.4 at 1.35 ms of host-side dispatch out of 1.59 ms in the plain config,
+and 0.2.0 at 0.38 ms out of 0.43 ms. So a large part of the measured speedup is
+0.2.0 issuing roughly 3x fewer operations, not its kernels being faster. Kernel
+time was not separated from dispatch time; that needs a quiet device and a
+profiler.
+
+**The outputs differ by more than roundoff, and the gap grows with position.**
+Output shapes match exactly in every configuration, but the values do not:
+
+| config | max abs difference | relative to max abs output |
+|---|---|---|
+| plain | 8.26e-04 | 2.5e-04 |
+| depthwise | 9.05e-05 | 1.4e-04 |
+| long-seq | 5.38e-03 | 5.7e-04 |
+
+The error is spread over the whole sequence rather than confined to the edges,
+and it grows in fp32 binades: mean absolute difference in the long-seq config is
+5.0e-04 below `t = 2048`, 9.2e-04 to `t = 4096`, 1.33e-03 to `t = 8192`, then
+flat at 2.1e-03. That is 0.0.4 deriving sample positions with a `linspace` in
+the offsets' dtype and forming the interpolation weight as `1 - |U - T|` at
+absolute position `T`, so its sub-sample fraction is quantised to the float
+spacing **at** `T`. 0.2.0 keeps window starts in `long` and carries only the
+fraction in the low-precision dtype, so its fraction is exact.
+
+This is the position-arithmetic hazard `CLAUDE.md` records, which is documented
+there as an fp16 problem. It is visible **in fp32, at ordinary speech lengths**.
+Section 2 and `EQUIVALENCE.md` reach the same conclusion against an analytic
+reference; this is the same defect seen end to end on a GPU.
+
+### 7.5 Not measured
+
+- An uncontended GPU. See the caveat above.
+- Kernel time separated from host dispatch time.
+- `PackedDeformConv1d`, deliberately: the two versions' offset-prediction
+  networks differ, so timing them would not compare like with like.
+- `torch.compile`, which 0.0.4 would graph-break on at its `self.device`
+  mutation.
+- fp16 or bf16, where the position-arithmetic gap above should be far larger.
