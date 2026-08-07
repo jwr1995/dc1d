@@ -6,7 +6,7 @@ https://speechbrain.readthedocs.io/en/latest/_modules/speechbrain/lobes/models/c
 See licence here: https://github.com/speechbrain/speechbrain/blob/develop/LICENSE
 Copyright SpeechBrain 2022.
 
-The reset_paramters functions were adapted from the PyTorch ConvNd classes:
+The reset_parameters functions were adapted from the PyTorch ConvNd classes:
 https://pytorch.org/docs/stable/_modules/torch/nn/modules/conv.html#Conv1d
 See licence here: https://github.com/pytorch/pytorch/blob/master/LICENSE
 Copyright 2022, PyTorch Contributors.
@@ -228,12 +228,11 @@ class DeformConv1d(nn.Module):
                 offsets to be applied for each position in the convolution kernel.
                 ``offset_groups`` may be 1 or any divisor of ``in_channels``.
             mask (Tensor[batch_size, offset_groups, output_length, kernel_size]):
-                Optional modulation scalars, one per sampled position: this is the
-                *v2* of Zhu et al. 2019 (DCNv2), which weights each tap by a
-                learned scalar as well as moving it. Same shape as ``offsets``.
-                Applied **as given**, exactly as ``torchvision.ops.deform_conv2d``
-                does: if you want the ``[0, 1]`` modulation of the paper, pass
-                ``mask.sigmoid()``. ``None`` (default) is plain DCNv1.
+                Optional modulation scalars, one per sampled position (DCNv2,
+                Zhu et al. 2019), same shape as ``offsets``. Applied **as given**,
+                like ``torchvision.ops.deform_conv2d``: pass ``mask.sigmoid()``
+                yourself for the ``[0, 1]`` modulation of the paper. ``None``
+                (default) is plain DCNv1.
 
         Returns:
             output (Tensor[batch_size, out_channels, output_length]): output tensor
@@ -270,11 +269,9 @@ class DeformConv1d(nn.Module):
             unconstrained=self.unconstrained,
         )
 
-        # Modulation (DCNv2). The interpolated tensor is
-        # (batch, in_channels, output_length, kernel_size) and its channel axis
-        # runs as (offset_groups, channels_per_group) -- the same split the
-        # interpolation kernel gathers under -- so unflattening it lines each
-        # group's channels up against that group's mask.
+        # Modulation (DCNv2). The interpolated channel axis runs as
+        # (offset_groups, channels_per_group), the same split the interpolation
+        # gathers under, so unflattening lines each group up against its mask.
         if mask is not None:
             input = (
                 input.unflatten(1, (mask.shape[1], -1)) * mask.unsqueeze(2).to(input.dtype)
@@ -403,10 +400,9 @@ class PackedDeformConv1d(DeformConv1d):
             )
             self.mdp_norm = gLN(kernel_size * offset_groups)
             self.mdp_prelu = nn.PReLU()
-            # Zero the last projection so every tap starts at sigmoid(0) == 0.5,
-            # uniformly. This is the DCNv2 reference initialisation: the mask
-            # starts uninformative and the layer has to learn to gate. Note it
-            # halves the output scale at initialisation relative to modulated=False.
+            # Zeroing the last projection starts every tap at sigmoid(0) == 0.5:
+            # the mask is uninformative until the layer learns to gate. It also
+            # halves the output scale at init relative to modulated=False.
             init.zeros_(self.mask_pconv.weight)
 
         if device is not None:

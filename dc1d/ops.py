@@ -37,6 +37,9 @@ def output_length(
 
         floor((length - dilation * (kernel_size - 1) - 1) / stride) + 1
 
+    Returns 0 when the input is shorter than the receptive field, where
+    :class:`torch.nn.Conv1d` raises.
+
     Args:
         length (int): Input sequence length (after any padding has been applied).
         kernel_size (int): Convolution kernel size.
@@ -70,62 +73,38 @@ def _dilated_positions_long(
 # ---------------------------------------------------------------------------
 # The gather + lerp core, and its backward.
 #
-# Every variant computes exactly the same forward:
+# All three variants compute the same forward:
 #
 #     x0 = x[i],  x1 = x[i + 1],  out = lerp(x0, x1, w)
 #
-# with ``i`` an integer index carrying no gradient and ``w`` the sub-sample
-# fraction. They differ only in how the backward is obtained, and therefore in
-# what has to be kept alive between the forward and the backward:
+# ``i`` is an integer index carrying no gradient; ``w`` is the sub-sample
+# fraction. They differ only in what the backward keeps alive:
 #
-#   ``autograd``   let autograd differentiate through ``gather`` and
-#                  ``lerp``. Correct, and the only variant that needs no
-#                  hand-written maths -- but ``lerp``'s backward needs both
-#                  ``x0`` and ``x1``, so two (B, C, L_out, K) tensors are held.
-#   ``save-diff``  a custom Function that stores the single tensor the offset
-#                  gradient actually needs, ``x1 - x0``. Half the saved
-#                  footprint of ``autograd``. **Restricted** -- see below.
-#   ``recompute``  a custom Function that stores nothing but the index and the
-#                  fraction and re-gathers ``x0``/``x1`` in the backward. Lowest
-#                  saved footprint; pays two extra gathers.
+#   ``autograd``   differentiates through ``gather`` and ``lerp``. ``lerp``'s
+#                  backward needs both ``x0`` and ``x1``, so two
+#                  (B, C, L_out, K) tensors are held.
+#   ``save-diff``  saves ``x1 - x0``, which is all the offset gradient reads.
+#                  Half of ``autograd``. Restricted, see below.
+#   ``recompute``  saves the index, the fraction and the input; re-gathers in
+#                  the backward. Smallest tape, two extra gathers.
 #
-# The backward maths, with ``g`` the upstream gradient:
+# With ``g`` the upstream gradient:
 #
-#     dL/dx    scatter-add ``g * (1 - w)`` at ``i`` and ``g * w`` at ``i + 1``
-#     dL/dw    ``sum_c g * (x1 - x0)``, summed over the channels sharing an
-#              offset group; ``i`` is detached and ``dw/d(offset) == 1``, so
-#              this is also dL/d(offset) before the group reduction.
+#     dL/dx    scatter-add ``g * (1 - w)`` at ``i``, ``g * w`` at ``i + 1``
+#     dL/dw    ``sum_c g * (x1 - x0)`` over the channels sharing an offset
+#              group. ``i`` is detached and ``dw/d(offset) == 1``, so this is
+#              dL/d(offset) before the group reduction.
 #
-# **What a custom Function costs.** Replacing pure ATen with an
-# ``autograd.Function`` is not free in capability, and both restrictions were
-# found by testing rather than reasoning:
+# A custom Function costs two capabilities, both found by testing and both
+# pinned in ``tests/test_gradients.py``: ``vmap``/``torch.func`` needs
+# ``setup_context`` + ``generate_vmap_rule`` (``recompute`` declares both;
+# ``save-diff`` cannot, its saved tensor is an intermediate), and double
+# backward through ``save-diff`` would be silently zero, so it raises instead.
+# That is why only ``recompute`` could ever become the default.
 #
-# *  ``vmap``/``torch.func``. A Function is opaque to functorch unless it
-#    declares ``setup_context`` and ``generate_vmap_rule``. Without them
-#    ``torch.vmap(layer)`` raises, where the pure-ATen kernel just works.
-#    ``recompute`` declares both. ``save-diff`` cannot: its saved tensor is an
-#    intermediate, not an input, and ``setup_context`` only sees inputs and
-#    outputs.
-# *  **Double backward.** ``save-diff`` stores ``x1 - x0`` as a *constant*, so
-#    ``d(dL/d offsets)/dx`` comes out zero instead of correct -- silently.
-#    ``recompute`` re-derives it from the saved input and is exact. ``save-diff``
-#    therefore raises under ``create_graph=True`` rather than returning a wrong
-#    answer.
-#
-# ``recompute`` is consequently the only one of the two that could ever be the
-# default; ``save-diff`` exists to separate the memory contribution of the saved
-# difference from that of the recomputation.
-#
-# **Determinism.** ``dL/dx`` is a scatter-add, which on CUDA accumulates with
-# atomics and is therefore *not* bitwise reproducible run to run. Measured, for
-# all three variants alike -- this is not something the custom Function
-# introduces, because the ``autograd`` variant's ``gather`` backward is
-# the same scatter-add. ``dL/d(offsets)`` is a plain reduction and is
-# reproducible. Under ``torch.use_deterministic_algorithms(True)`` PyTorch
-# substitutes a deterministic ``scatter_add_`` rather than raising, and all
-# three variants become bitwise reproducible; nothing here needs a
-# ``deterministic`` opt-out. See BACKENDS.md section 5.9 and
-# ``tests/test_gradients.py::test_input_gradient_scatter_is_deterministic_on_cpu``.
+# ``dL/dx`` is a scatter-add, so on CUDA it is not bitwise reproducible, for
+# all three alike; ``use_deterministic_algorithms(True)`` makes it so rather
+# than raising. ``benchmarks/BACKENDS.md`` section 5.9.
 # ---------------------------------------------------------------------------
 
 
@@ -133,32 +112,20 @@ def _gather_pair(xg: Tensor, idx: Tensor) -> tuple[Tensor, Tensor]:
     """
     ``(x[i], x[i + 1])`` along the length axis of ``(B, G, C/G, L)``.
 
-    ``idx`` has a singleton channel axis and is `expand`ed rather than tiled, so
-    one index serves every channel in its offset group. The expansion is a
-    stride-0 view that ``gather`` reads through a strided iterator, and the view
-    is what its backward saves: measured, ``_saved_index`` comes out with stride
-    ``(3066, 3066, 0, 1)`` at 0.094 MiB where ``take_along_dim`` saved
-    ``(196224, 196224, 3066, 1)`` at 5.988 MiB, because ``take_along_dim``
-    broadcasts by materialising a copy before dispatching to gather. That is
-    worth 1.5-1.6x peak memory eager and 2.2-2.5x compiled whenever
-    ``offset_groups < channels`` (``BACKENDS.md`` 5.9.4a). This is the same trick
-    ``_scatter_input_grad`` uses.
+    ``idx`` has a singleton channel axis and is ``expand``ed rather than tiled,
+    so one index serves every channel in its offset group. The expansion is a
+    stride-0 view, and that view is what ``gather``'s backward saves: 0.094 MiB
+    against 5.988 MiB for the same call under ``take_along_dim``, which
+    broadcasts by materialising a copy first (``benchmarks/BACKENDS.md``
+    5.9.4a). ``_scatter_input_grad`` uses the same trick.
 
-    **Why not ``take_along_dim``.** It broadcasts the index itself, so the
-    ``expand`` here looks redundant, and it was what this function used to call.
-    But ``take_along_dim`` decomposes to a *negative-index wrap*,
-    ``index % self.size(dim)``, before the gather, and **from torch 2.10** the
-    ONNX exporter constant-folds that modulus against the export-time length:
-    the graph gets a literal ``Mod(index, 200)`` for a model exported at
-    ``L = 200``. Every longer input then wraps around and reads the wrong
-    samples, at full signal magnitude, with the *right* output shape and no
-    error raised. ``gather`` takes no negative indices, so it emits no ``Mod``
-    and stays length-agnostic. Our indices are clamped into ``[0, L - 2]``
-    regardless, so the wrap was only ever dead arithmetic.
-
-    Bisected across CPU wheels (``tests/test_export.py``, TODO.md E8): clean on
-    2.7, 2.8, 2.9; broken on 2.10, 2.11, 2.12, 2.13. Do not "restore"
-    ``take_along_dim`` on the grounds that an old torch exports it correctly.
+    **Do not restore ``take_along_dim``.** It decomposes to a negative-index
+    wrap, ``index % self.size(dim)``, and from torch 2.10 the ONNX exporter
+    constant-folds that modulus against the export-time length: a model
+    exported at ``L = 200`` gets a literal ``Mod(index, 200)``, then reads the
+    wrong samples at any greater length, with the right shape and no error
+    raised. ``gather`` takes no negative indices and emits no ``Mod``.
+    Per-version bisect in TODO.md E8; guarded by ``tests/test_export.py``.
     """
     shape = (xg.shape[0], xg.shape[1], xg.shape[2], idx.shape[3])
     # `+ 1` before the expand, never after: on the expanded view it would
@@ -215,14 +182,10 @@ class _GatherLerpSaveDiff(torch.autograd.Function):
         # form returns x0 + (x1 - x0), which is not x1 in floating point. The
         # nn.Conv1d bit-exactness invariant depends on this.
         out = torch.lerp(x0, x1, w)
-        # `x1 - x0` is read by the offset gradient and by nothing else, so an
-        # inference pass must not pay for it: without this guard every forward
-        # allocates and writes an extra (B, C, L_out, K) tensor. The size of that
-        # saving is not in `benchmarks/BACKENDS.md`; section 5.9.3 times the
-        # variants against each other, not this guard against itself.
-        # `ctx.needs_input_grad` is populated before `forward` runs; it is not
-        # affected by `torch.no_grad()`, which is the one case this still
-        # over-computes -- inference on a leaf that happens to require grad.
+        # `x1 - x0` is read by the offset gradient and nothing else, so an
+        # inference pass must not allocate it. `needs_input_grad` is populated
+        # before `forward` runs and ignores `torch.no_grad()`, which is the one
+        # case this still over-computes.
         diff = x1 - x0 if ctx.needs_input_grad[2] else None
         ctx.save_for_backward(idx, w, diff)
         ctx.length = xg.shape[3]
@@ -332,38 +295,25 @@ def efficient_linterpolate(
             to its own receptive field. When ``True`` taps may sample anywhere in
             the sequence.
         gather_lerp (str, optional): How the backward is computed. All three
-            options produce the **same forward, bit for bit**, and the same
-            gradients to within rounding; they differ only in what is kept alive
-            between the forward and the backward. ``None`` means
+            produce the **same forward, bit for bit**, and the same gradients to
+            within rounding; they differ only in what is kept alive between the
+            forward and the backward. ``None`` means
             :data:`DEFAULT_GATHER_LERP`.
 
-            * ``'autograd'`` (default) -- differentiate through ``gather``
-              and ``lerp``. No restrictions.
-            * ``'recompute'`` -- a custom :class:`torch.autograd.Function` that
-              saves the integer index, the fraction and the input ``x`` (which
-              the caller normally holds alive anyway), re-gathering ``x0``/``x1``
-              in the backward, for **10-23%
-              slower** eager forward+backward and **0-12% faster** compiled
-              (``benchmarks/BACKENDS.md`` section 5.9.7).
-              Supports ``vmap`` and double backward.
+            * ``'autograd'`` (default) -- differentiate through ``gather`` and
+              ``lerp``. No restrictions.
+            * ``'recompute'`` -- custom Function saving the index, the fraction
+              and ``x``, re-gathering in the backward. Supports ``vmap`` and
+              double backward. Costs 10-23% of eager forward+backward, 0-12%
+              faster compiled. Saves 1.6-2.1x peak eager at
+              ``offset_groups == channels``, but only ~1.3x below that: the
+              2026-08 ``gather`` rewrite took most of that saving into the
+              default.
+            * ``'save-diff'`` -- saves ``x1 - x0``. Cheaper eagerly (0-8%) but
+              **not** usable with ``vmap``/``torch.func`` and **raises** under
+              ``create_graph=True``. Kept for measurement; do not build on it.
 
-              **How much memory it saves depends on ``offset_groups``**, and the
-              answer changed when the default forward moved to ``gather``
-              (``benchmarks/BACKENDS.md`` sections 5.9.4 and 5.9.4a). With
-              ``offset_groups == channels`` the default holds 8.5x the output and
-              this saves **1.6-2.1x** peak eager, unchanged and still clearly
-              worth it. With ``offset_groups < channels`` the default now holds
-              only ~3x, and the saving is down to about **1.3x**. The older
-              1.6-2.1x figure quoted for that case was against the
-              ``take_along_dim`` forward and no longer applies.
-            * ``'save-diff'`` -- saves ``x1 - x0``. Same compiled behaviour as
-              ``'recompute'`` and a smaller eager latency cost (0-8%) for a
-              smaller memory saving, quoted as 1.6-1.8x in section 5.9.4 but
-              measured against the pre-2026-08 ``take_along_dim`` default and so
-              overstated for the same reason as the bullet above), but it is
-              **not** usable with
-              ``vmap``/``torch.func`` and **raises** under ``create_graph=True``.
-              Kept for measurement; do not build on it.
+            Numbers from ``benchmarks/BACKENDS.md`` sections 5.9.4a and 5.9.7.
 
     Returns:
         Tensor of shape ``(batch, channels, out_length, kernel_size)``.
@@ -401,16 +351,11 @@ def efficient_linterpolate(
     dilated = _dilated_positions_long(kernel_size, dilation, x.device, dilated_positions)
     max_tap = dilation * (kernel_size - 1)  # compile-time constant, no device reduction
 
-    # ------------------------------------------------------------------
-    # Precision decomposition.
-    #
-    # The sampling position is T = t0 + dilated_position + offset. The first two
-    # terms are exact integers and are kept in `long`; only the sub-sample
-    # fraction is ever carried in the (possibly fp16, under autocast) offset
-    # dtype. Materialising T as a single low-precision float -- as this function
-    # used to -- destroys the window positions for sequences longer than ~2k,
-    # silently and without producing NaNs.
-    # ------------------------------------------------------------------
+    # Precision decomposition. T = t0 + dilated_position + offset; the first two
+    # terms are exact integers kept in `long`, and only the sub-sample fraction is
+    # carried in the (possibly fp16) offset dtype. Materialising T as one
+    # low-precision float, as this function used to, destroys window positions
+    # past ~2k samples, silently and without NaNs.
     t0 = (torch.arange(out_length, device=x.device, dtype=torch.long) * stride).unsqueeze(-1)
 
     # Position of each tap *relative to its window start*; small magnitude.
@@ -443,15 +388,10 @@ def efficient_linterpolate(
         print("index:", tuple(index.shape))
         print("frac:", tuple(frac.shape))
 
-    # ------------------------------------------------------------------
-    # Gather + lerp.
-    #
-    # The index tensor is never tiled up to the channel count: it carries a
-    # singleton channel axis and `_gather_pair` expands it to a stride-0 view.
-    # Viewing the channel axis as (groups, channels_per_group) lets a single
-    # index serve every channel in its offset group, including the
-    # 1 < groups < channels case.
-    # ------------------------------------------------------------------
+    # Gather + lerp. The index is never tiled to the channel count: it keeps a
+    # singleton channel axis that `_gather_pair` expands to a stride-0 view, and
+    # viewing channels as (groups, channels_per_group) lets one index serve every
+    # channel in its group, including 1 < groups < channels.
     per_group = channels // groups
     xg = x.reshape(batch, groups, per_group, length)
     idx = index.reshape(batch, groups, 1, out_length * kernel_size)
