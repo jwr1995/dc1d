@@ -664,33 +664,43 @@ Landed **after** tests 1–4 were green, and re-verified green afterwards.
 
 ## Release
 
-- [x] `.github/workflows/release.yml.disabled` written as a **scaffold only**. It is
-      named `.disabled` so GitHub Actions will not pick it up, its only trigger is
-      `workflow_dispatch` (the `push: tags:` trigger is commented out), and it
-      references **no secrets** — publishing would go through PyPI trusted
-      publishing (OIDC), hence `permissions: id-token: write`.
-- [x] It includes a tag↔`__version__` consistency check and a `twine check` step.
-- [ ] **NOT activated. Nothing has been published, and no PyPI configuration was
-      touched.** Remaining, in order:
+- [x] `.github/workflows/release.yml` is **active** (renamed from
+      `release.yml.disabled`, 2026-08-07). A `v*` tag push builds, checks the tag
+      against `__version__`, `twine check`s, smoke-imports the built wheel, and
+      creates the GitHub Release using the **annotated tag's own message** as the
+      body. That path needs no configuration at all beyond the built-in
+      `GITHUB_TOKEN`, so it works today.
+- [x] Release creation is idempotent: re-running for an existing tag replaces the
+      attached artifacts rather than failing.
+- [x] `v0.2.0` tagged against `c446949` and pushed 2026-08-07. Its Release has to
+      be created by hand, because the tag went up while this workflow was still
+      `.disabled`; a tag push is only a trigger going forward. The long-form notes
+      for it were written to `~/dc1d-release-notes.md`, which is **outside the
+      repository**: see the CHANGELOG item below.
+- [ ] **Consider a `CHANGELOG.md`.** Right now the release body comes from the tag
+      message, so anything longer than a tag message (the v0.2.0 notes are 11.7 KB,
+      covering 55 commits back to v0.0.6) has nowhere in-repo to live. Either keep
+      tag messages short and accept that, or add a CHANGELOG and point the workflow
+      at the relevant section instead. Not decided.
+- [ ] **Nothing has been published to PyPI, and the publish job cannot succeed
+      until the two items below are done.** That is exactly why a tag push does
+      *not* trigger it and `workflow_dispatch` does. PyPI still serves `0.0.7`
+      (confirmed 2026-08-07), so the first publish from this line would be
+      `v0.2.0`.
       1. **Trusted publisher on PyPI.** Add a publisher for project `dc1d`, owner
          `jwr1995`, repo `dc1d`, workflow filename `release.yml`, environment `pypi`.
          Do the same on TestPyPI with environment `testpypi`.
          https://docs.pypi.org/trusted-publishers/adding-a-publisher/
       2. **GitHub environments.** Create `pypi` and `testpypi`. Recommend a required
          reviewer on `pypi` so every upload is human-approved.
-      3. **Tag convention — needs an owner decision.** The scaffold assumes
-         `v<version>` (e.g. `v0.1.0`) matching `dc1d/__init__.py:__version__`, and
-         verifies the two agree.
-      4. **Publish from tags? — needs an owner decision.** Currently
-         `workflow_dispatch` only. To publish from tags, uncomment the
-         `push: tags: ["v*"]` trigger *and* rename the file to `release.yml`.
-         Recommendation: keep `workflow_dispatch` for a first TestPyPI dry run,
-         then switch to tags.
-      5. ~~**Version bump.**~~ Done: `0.0.7` → **`0.1.0`**, for the breaking changes
-         in this pass (`self.device` removed, offset-shape mismatches now raise,
-         `requires-python >= 3.10`). PyPI still has `0.0.7`, so the first publish
-         from this line will be `v0.1.0`.
-      6. **Rename** `release.yml.disabled` → `release.yml` as the last step.
+      3. ~~**Tag convention.**~~ Settled: `v<version>` matching
+         `dc1d/__init__.py:__version__`, and the build job fails if they disagree.
+      4. ~~**Publish from tags?**~~ Settled: **no**. A PyPI version can never be
+         re-uploaded, only yanked, so the irreversible step stays a deliberate
+         `workflow_dispatch` with a TestPyPI default. Do a TestPyPI dry run first.
+      5. ~~**Version bump.**~~ Done: `0.0.7` → `0.1.0` → **`0.2.0`**, the latter for
+         the torch floor raise and the ONNX/modulation pass.
+      6. ~~**Rename** `release.yml.disabled` → `release.yml`.~~ Done.
 
 ---
 

@@ -1,0 +1,159 @@
+# =============================================================================
+# Two independent things live in this file, and they are gated differently.
+#
+#   Tag push (v*)      -> build, verify, and create the GitHub Release.
+#                         Needs no configuration beyond the built-in
+#                         GITHUB_TOKEN, so it works today.
+#   workflow_dispatch  -> the above, plus upload to TestPyPI or PyPI.
+#                         Needs a PyPI Trusted Publisher and a matching GitHub
+#                         environment, NEITHER OF WHICH EXISTS YET. Until they
+#                         do, the publish job will fail; that is why a tag push
+#                         does not trigger it.
+#
+# Publishing is deliberately a human action rather than a tag side effect. A
+# PyPI version can never be re-uploaded, so the irreversible step asks first.
+# See the "Release" section of TODO.md for what remains to enable it.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Verify tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          uv sync --locked
+          PKG_VERSION=$(uv run python -c "import dc1d; print(dc1d.__version__)")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $TAG_VERSION does not match dc1d.__version__ $PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+      # Duplicates ci.yml's `build` job on purpose. That one guards the branch;
+      # this one guards the artifact that is about to be published, and a bad
+      # PyPI upload cannot be replaced, only yanked.
+      - name: Import from built wheel
+        run: |
+          uv venv /tmp/wheeltest
+          VIRTUAL_ENV=/tmp/wheeltest uv pip install \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            dist/*.whl
+          /tmp/wheeltest/bin/python -c "import dc1d; print(dc1d.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # Creates the GitHub Release for a pushed tag. Uses the annotated tag's own
+  # message as the release body, so the notes are written once, at `git tag -a`,
+  # and live in the repository rather than only in GitHub's database.
+  github-release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Release notes from the annotated tag
+        run: |
+          # actions/checkout leaves the tag as a ref but not necessarily as the
+          # annotated object, so re-fetch it before reading its message.
+          git fetch --force --tags
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::warning::$GITHUB_REF_NAME has no message; generating notes from commits"
+          fi
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A pre-release is any tag with a suffix: v1.2.3-rc1, v1.2.3b1.
+          PRERELEASE=""
+          case "${GITHUB_REF_NAME#v}" in
+            *[!0-9.]*) PRERELEASE="--prerelease" ;;
+          esac
+
+          if [ -s notes.md ]; then
+            NOTES="--notes-file notes.md"
+          else
+            NOTES="--generate-notes"
+          fi
+
+          # Idempotent: re-running for an existing release replaces the
+          # artifacts rather than failing the job.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME exists; replacing artifacts."
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" $PRERELEASE $NOTES
+          fi
+
+  # workflow_dispatch only. See the header: this job cannot succeed until a
+  # Trusted Publisher and the matching GitHub environment exist.
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}
+    permissions:
+      id-token: write # PyPI trusted publishing (OIDC). No API token is used.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        if: inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI
+        if: inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
